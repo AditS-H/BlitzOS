@@ -1,0 +1,55 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.bin
+*.iso
+*.img
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Toolchain
+tools/cross/
+
+# Generated files
+iso/
+*.map
+*.sym
+
+# Debug files
+*.log
+*.out
+
+# Backup files
+*.bak
+*.old
+
+# Archives
+*.tar
+*.gz
+*.zip
+*.rar
+
+# Core dumps
+core
+vgcore.*
+
+# QEMU files
+*.qcow2
+qemu.log
+
+# Markdown files except README.md
+*.md
+!README.md
+
