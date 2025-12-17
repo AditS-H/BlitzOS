@@ -1,4 +1,4 @@
-/* Linker script for MyOS kernel - x86-64 architecture
+/* Linker script for BlitzOS kernel - x86-64 architecture
  * This script tells the linker how to organize our kernel in memory
  */
 

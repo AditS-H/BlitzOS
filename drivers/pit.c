@@ -1,5 +1,6 @@
 #include "pit.h"
 #include "../kernel/arch/x86_64/interrupts.h"
+#include "../kernel/proc/process.h"
 
 // Global tick counter
 static volatile uint64_t timer_ticks = 0;
@@ -7,6 +8,9 @@ static volatile uint64_t timer_ticks = 0;
 // PIT interrupt handler (called from IRQ0)
 void pit_handler(void) {
     timer_ticks++;
+    scheduler_tick();  // Update scheduler state
+    // Note: We DON'T call do_schedule() from interrupt context!
+    // Context switching from interrupts requires saving the current process first
 }
 
 // Initialize the PIT

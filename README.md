@@ -1,28 +1,29 @@
-# Operating System Development Project
+# BlitzOS - A Modern x86-64 Operating System
 
-> Building a scalable operating system from scratch - A comprehensive learning journey
+> Building a high-performance operating system from scratch with multitasking support
 
-## 🎯 Project Overview
+## 🎉 Project Status: MULTITASKING WORKING! 🎉
 
-This project documents the complete process of creating a lightweight, high-performance operating system from scratch. **Current Status:** Kernel foundation complete with boot system, memory management (PMM + paging + heap), interrupt system, and device drivers (VGA, keyboard, timer) all working. Next phase: process scheduler and multitasking.
+**Current Achievement:** Full cooperative multitasking with 3+ concurrent processes, round-robin scheduling, and context switching. See A, B, C characters printing in rotation!
 
 ## 📚 Documentation Structure
 
 ### Essential Reading (Start Here)
 - **[whole documentation/INDEX.md](whole documentation/INDEX.md)** - Complete documentation index and navigation
+- **[whole documentation/achieved.md](whole documentation/achieved.md)** - ✅ All completed features
 - **[whole documentation/OS_QUICK_REFERENCE.md](whole documentation/OS_QUICK_REFERENCE.md)** - Strategic overview & current status
-- **[whole documentation/learning.md](whole documentation/learning.md)** - Complete implementation guide (2,886 lines)
+- **[whole documentation/learning.md](whole documentation/learning.md)** - Complete implementation guide (3,500+ lines with multitasking!)
 - **[whole documentation/OS_PROGRESS_TRACKING.md](whole documentation/OS_PROGRESS_TRACKING.md)** - Feature comparison matrix
 
 ### Strategic Documents
-- **[whole documentation/OS_COMPETITIVE_ADVANTAGE.md](whole documentation/OS_COMPETITIVE_ADVANTAGE.md)** - Why MyOS is better than Linux for specific use cases
+- **[whole documentation/OS_COMPETITIVE_ADVANTAGE.md](whole documentation/OS_COMPETITIVE_ADVANTAGE.md)** - Why BlitzOS is better than Linux for specific use cases
 - **[whole documentation/architecture.md](whole documentation/architecture.md)** - Architecture decisions and technology stack
 
 ## 🏗️ Architecture Decisions
 
 **Design Philosophy**: Unix-like monolithic kernel  
-**Target Architecture**: x86-64  
-**Primary Language**: C (99%) + Assembly (1%)  
+**Target Architecture**: x86-64 (64-bit long mode)  
+**Primary Language**: C (92%) + Assembly x86-64 (8%)  
 **Build System**: GNU Make + GCC cross-compiler  
 **Testing Platform**: QEMU emulator  
 
@@ -52,45 +53,61 @@ sudo apt install build-essential nasm qemu-system-x86 gdb git
 sudo apt install libgmp-dev libmpfr-dev libmpc-dev texinfo
 ```
 
-### Build Your First Kernel
+### Build & Run Your Kernel
 ```bash
-cd ~/OS
-make          # Compile kernel
-make run      # Run in QEMU
-make debug    # Run with GDB debugging
+# From Windows (WSL2):
+wsl -e bash -c "cd /mnt/c/Users/over9/Desktop/Coding/OS && make clean && make all"
+
+# Or from inside WSL:
+cd ~/OS  # or wherever you cloned
+make all              # Compile kernel and create BlitzOS.iso
+make run              # Run in QEMU and watch multitasking!
+make run-serial       # Run in QEMU with serial output
+make debug            # Debug with GDB
+make clean            # Remove build artifacts
+make help             # Show all available commands
 ```
 
-## 📖 Learning Path
+## 📖 Learning Path & Current Progress
 
-### Phase 1: Foundation (Weeks 1-4)
-- Environment setup
-- Bootloader development
-- Basic kernel with VGA output
-- Interrupt handling (GDT, IDT, ISR)
+### ✅ Phase 1: Foundation (COMPLETE)
+- ✅ Environment setup (cross-compiler, QEMU, build system)
+- ✅ Bootloader (GRUB2 + Multiboot2)
+- ✅ Basic kernel with VGA text output
+- ✅ Interrupt handling (GDT, IDT, ISR)
 
-### Phase 2: Memory Management (Weeks 5-8)
-- Physical memory manager
-- Virtual memory (paging)
-- Kernel heap allocator
-- Memory protection
+### ✅ Phase 2: Memory Management (COMPLETE)
+- ✅ Physical memory manager (bitmap-based)
+- ✅ Virtual memory (4-level paging)
+- ✅ Kernel heap allocator (kmalloc/kfree)
+- ✅ Memory protection via paging
 
-### Phase 3: Process Management (Weeks 9-12)
-- Process structures
-- Context switching
-- Scheduler implementation
-- System calls
+### ✅ Phase 3: Process Management & Multitasking (COMPLETE!) 🎉
+- ✅ Process structures (Task Control Block - TCB)
+- ✅ Context switching (save/restore CPU registers)
+- ✅ Scheduler implementation (round-robin)
+- ✅ Cooperative multitasking
+- ✅ Process creation and lifecycle
+- ✅ **DEMO: 3 concurrent processes printing AAABBBCCC...**
 
-### Phase 4: File System (Weeks 13-16)
-- VFS layer design
-- Basic filesystem implementation
-- File operations
-- Directory management
+### ⏳ Phase 4: Preemptive Multitasking (PLANNED)
+- ⏳ Timer interrupt forced context switches
+- ⏳ Process priorities
+- ⏳ Sleep/wake mechanisms
+- ⏳ Preemptive scheduler improvements
 
-### Phase 5: Device Drivers (Weeks 17-20)
-- Driver framework
-- Keyboard, mouse, timer drivers
-- Disk driver (ATA/AHCI)
-- Serial port for debugging
+### ⏳ Phase 5: File System (NOT STARTED)
+- ⏳ VFS layer design
+- ⏳ Basic filesystem implementation
+- ⏳ File operations
+- ⏳ Directory management
+
+### ⏳ Phase 6: Advanced Drivers (NOT STARTED)
+- ⏳ Disk driver (ATA/AHCI)
+- ⏳ Serial port for debugging
+- ⏳ Network stack (future)
+- ⏳ GPU support (future)
+
 
 ### Phase 6: User Space (Weeks 21-24)
 - ELF loader
@@ -145,19 +162,20 @@ See [troubleshooting.md](troubleshooting.md) for detailed solutions.
 
 ```
 OS/
-├── boot/              # Bootloader code
-├── kernel/            # Core kernel
-│   ├── arch/         # Architecture-specific code
-│   ├── mm/           # Memory management
-│   ├── process/      # Process management
-│   └── fs/           # File system
-├── drivers/          # Device drivers
-├── lib/              # Kernel library functions
-├── include/          # Header files
-├── userspace/        # User programs and shell
-├── build/            # Build artifacts
-├── docs/             # Documentation
-└── tools/            # Development utilities
+├── boot/                   # Bootloader code
+├── kernel/                 # Core kernel
+│   ├── arch/               # Architecture-specific code
+│   ├── mm/                 # Memory management
+│   ├── process/            # Process management
+│   └── fs/                 # File system
+├── drivers/                # Device drivers
+├── lib/                    # Kernel library functions
+├── include/                # Header files
+├── userspace/              # User programs and shell
+├── build/                  # Build artifacts
+├── docs/                   # Documentation
+├── tools/                  # Development utilities
+└── whole documentation/    # All the ReadMe with whole structure 
 ```
 
 ## 🎯 Current Status

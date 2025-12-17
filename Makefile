@@ -1,4 +1,4 @@
-# MyOS Makefile - Build system for x86-64 operating system
+# BlitzOS Makefile - Build system for x86-64 operating system
 # Cross-compiler toolchain
 AS = nasm
 CC = /usr/local/cross/bin/x86_64-elf-gcc
@@ -21,18 +21,18 @@ ISOBOOT_DIR = $(ISO_DIR)/boot
 GRUB_DIR = $(ISOBOOT_DIR)/grub
 
 # Source files
-ASM_SOURCES = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_load.asm $(ARCH_DIR)/isr.asm
-C_SOURCES = $(CORE_DIR)/kernel.c $(KERNEL_DIR)/boot/multiboot2.c $(KERNEL_DIR)/mm/pmm.c $(KERNEL_DIR)/mm/paging.c $(KERNEL_DIR)/mm/kheap.c $(DRIVERS_DIR)/vga.c $(DRIVERS_DIR)/pit.c $(DRIVERS_DIR)/keyboard.c $(ARCH_DIR)/idt.c $(ARCH_DIR)/interrupts.c
+ASM_SOURCES = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_load.asm $(ARCH_DIR)/isr.asm $(ARCH_DIR)/context_switch.asm
+C_SOURCES = $(CORE_DIR)/kernel.c $(KERNEL_DIR)/boot/multiboot2.c $(KERNEL_DIR)/mm/pmm.c $(KERNEL_DIR)/mm/paging.c $(KERNEL_DIR)/mm/kheap.c $(KERNEL_DIR)/proc/process.c $(DRIVERS_DIR)/vga.c $(DRIVERS_DIR)/pit.c $(DRIVERS_DIR)/keyboard.c $(ARCH_DIR)/idt.c $(ARCH_DIR)/interrupts.c
 
 # Object files
-ASM_OBJECTS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/idt_load.o $(BUILD_DIR)/isr.o
-C_OBJECTS = $(BUILD_DIR)/kernel.o $(BUILD_DIR)/multiboot2.o $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o $(BUILD_DIR)/vga.o $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/idt.o $(BUILD_DIR)/interrupts.o
+ASM_OBJECTS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/idt_load.o $(BUILD_DIR)/isr.o $(BUILD_DIR)/context_switch.o
+C_OBJECTS = $(BUILD_DIR)/kernel.o $(BUILD_DIR)/multiboot2.o $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o $(BUILD_DIR)/process.o $(BUILD_DIR)/vga.o $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/idt.o $(BUILD_DIR)/interrupts.o
 
 ALL_OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
 
 # Output
 KERNEL_BIN = $(ISOBOOT_DIR)/kernel.bin
-ISO_FILE = MyOS.iso
+ISO_FILE = BlitzOS.iso
 
 # Default target
 .PHONY: all
@@ -98,6 +98,14 @@ $(BUILD_DIR)/isr.o: $(ARCH_DIR)/isr.asm | $(BUILD_DIR)
 	@echo "[AS] $<"
 	@$(AS) $(ASFLAGS) $< -o $@
 
+$(BUILD_DIR)/context_switch.o: $(ARCH_DIR)/context_switch.asm | $(BUILD_DIR)
+	@echo "[AS] $<"
+	@$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD_DIR)/process.o: $(KERNEL_DIR)/proc/process.c | $(BUILD_DIR)
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
 # Link kernel
 $(KERNEL_BIN): $(ALL_OBJECTS) scripts/linker.ld | $(BUILD_DIR)
 	@echo "[LD] Linking kernel..."
@@ -114,13 +122,13 @@ $(ISO_FILE): $(KERNEL_BIN) boot/grub/grub.cfg
 # Run in QEMU
 .PHONY: run
 run: $(ISO_FILE)
-	@echo "[QEMU] Starting MyOS..."
+	@echo "[QEMU] Starting BlitzOS..."
 	@qemu-system-x86_64 -cdrom $(ISO_FILE)
 
 # Run with serial output (useful for debugging)
 .PHONY: run-serial
 run-serial: $(ISO_FILE)
-	@echo "[QEMU] Starting MyOS with serial output..."
+	@echo "[QEMU] Starting BlitzOS with serial output..."
 	@qemu-system-x86_64 -cdrom $(ISO_FILE) -serial stdio
 
 # Debug with QEMU (waits for GDB connection on port 1234)
@@ -146,7 +154,7 @@ distclean: clean
 # Display help
 .PHONY: help
 help:
-	@echo "MyOS Build System"
+	@echo "BlitzOS Build System"
 	@echo "================="
 	@echo "Available targets:"
 	@echo "  all          - Build kernel and create bootable ISO (default)"
