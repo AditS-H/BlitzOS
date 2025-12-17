@@ -38,6 +38,7 @@ void vga_clear(void);
 void vga_putchar(char c, vga_color_t color);
 void vga_print(const char* str, vga_color_t color);
 void vga_print_hex(uint64_t value);
+void vga_print_int(int32_t value, vga_color_t color);
 void vga_set_cursor(uint8_t x, uint8_t y);
 
 #endif // VGA_H

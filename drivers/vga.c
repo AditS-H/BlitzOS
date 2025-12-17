@@ -110,3 +110,35 @@ void vga_print_hex(uint64_t value) {
     
     vga_print(hex, VGA_COLOR_LIGHT_CYAN);
 }
+
+// Print a 32-bit signed integer
+void vga_print_int(int32_t value, vga_color_t color) {
+    char buffer[12];  // -2147483648 + null terminator
+    int pos = 0;
+    
+    if (value < 0) {
+        vga_putchar('-', color);
+        value = -value;
+    }
+    
+    // Convert to decimal
+    if (value == 0) {
+        vga_putchar('0', color);
+        return;
+    }
+    
+    int divisor = 1000000000;
+    int started = 0;
+    
+    while (divisor > 0) {
+        int digit = value / divisor;
+        value %= divisor;
+        
+        if (digit != 0 || started || divisor == 1) {
+            vga_putchar('0' + digit, color);
+            started = 1;
+        }
+        
+        divisor /= 10;
+    }
+}
