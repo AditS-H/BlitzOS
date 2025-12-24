@@ -4,6 +4,7 @@ section .text
 ; External C handlers
 extern isr_handler
 extern irq_handler
+extern preempt_handler
 
 ; Macro to create ISR stubs without error code
 %macro ISR_NOERRCODE 1
@@ -152,11 +153,25 @@ irq_common_stub:
     push r14
     push r15
     
-    ; Call C handler
+    ; Get IRQ number
     mov rdi, [rsp + 120]   ; Get IRQ number (after all pushes)
     sub rdi, 32             ; Convert to IRQ 0-15
+    
+    ; Check if this is IRQ0 (timer) - special handling for preemption
+    cmp rdi, 0
+    jne .regular_irq
+    
+    ; Timer IRQ - handle preemption
+    mov rdi, rsp           ; Pass current stack pointer
+    call preempt_handler
+    mov rsp, rax           ; Use returned stack pointer (may be different process)
+    jmp .restore_and_return
+    
+.regular_irq:
+    ; Regular IRQ handling  
     call irq_handler
     
+.restore_and_return:
     ; Restore all registers
     pop r15
     pop r14
