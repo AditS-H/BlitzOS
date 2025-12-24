@@ -7,7 +7,9 @@
 #define MAX_PROCESSES 256
 #define PROCESS_STACK_SIZE 8192
 #define DEFAULT_PRIORITY 128
-#define TIME_SLICE_TICKS 10
+#define TIME_SLICE_TICKS 20
+// Set to 1 to enable periodic scheduler summary prints
+#define DEBUG_SCHED_SUMMARY 1
 
 // Process states
 typedef enum {
@@ -79,6 +81,9 @@ void scheduler_print_stats(void);
 
 // Assembly function for context switching
 extern void context_switch_asm(process_t* current, process_t* next);
+
+// Preemptive context switch from interrupt (returns new stack pointer)
+uint64_t preempt_handler(uint64_t stack_ptr);
 
 // Reschedule flag (set by timer)
 extern volatile uint8_t need_reschedule;

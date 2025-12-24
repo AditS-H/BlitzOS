@@ -6,7 +6,7 @@
 
 **Current Achievement:** Full cooperative multitasking with 3+ concurrent processes, round-robin scheduling, and context switching. See A, B, C characters printing in rotation!
 
-## 📚 Documentation Structure
+## � Documentation Structure
 
 ### Essential Reading (Start Here)
 - **[whole documentation/INDEX.md](whole documentation/INDEX.md)** - Complete documentation index and navigation
