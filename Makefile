@@ -21,12 +21,12 @@ ISOBOOT_DIR = $(ISO_DIR)/boot
 GRUB_DIR = $(ISOBOOT_DIR)/grub
 
 # Source files
-ASM_SOURCES = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_load.asm $(ARCH_DIR)/isr.asm $(ARCH_DIR)/context_switch.asm
-C_SOURCES = $(CORE_DIR)/kernel.c $(KERNEL_DIR)/boot/multiboot2.c $(KERNEL_DIR)/mm/pmm.c $(KERNEL_DIR)/mm/paging.c $(KERNEL_DIR)/mm/kheap.c $(KERNEL_DIR)/proc/process.c $(DRIVERS_DIR)/vga.c $(DRIVERS_DIR)/pit.c $(DRIVERS_DIR)/keyboard.c $(ARCH_DIR)/idt.c $(ARCH_DIR)/interrupts.c
+ASM_SOURCES = $(BOOT_DIR)/boot.asm $(ARCH_DIR)/idt_load.asm $(ARCH_DIR)/isr.asm $(ARCH_DIR)/context_switch.asm $(KERNEL_DIR)/sys/syscall_asm.asm
+C_SOURCES = $(CORE_DIR)/kernel.c $(KERNEL_DIR)/boot/multiboot2.c $(KERNEL_DIR)/mm/pmm.c $(KERNEL_DIR)/mm/paging.c $(KERNEL_DIR)/mm/kheap.c $(KERNEL_DIR)/proc/process.c $(DRIVERS_DIR)/vga.c $(DRIVERS_DIR)/pit.c $(DRIVERS_DIR)/keyboard.c $(ARCH_DIR)/idt.c $(ARCH_DIR)/interrupts.c $(KERNEL_DIR)/sys/syscall.c $(KERNEL_DIR)/test_syscalls.c
 
 # Object files
-ASM_OBJECTS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/idt_load.o $(BUILD_DIR)/isr.o $(BUILD_DIR)/context_switch.o
-C_OBJECTS = $(BUILD_DIR)/kernel.o $(BUILD_DIR)/multiboot2.o $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o $(BUILD_DIR)/process.o $(BUILD_DIR)/vga.o $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/idt.o $(BUILD_DIR)/interrupts.o
+ASM_OBJECTS = $(BUILD_DIR)/boot.o $(BUILD_DIR)/idt_load.o $(BUILD_DIR)/isr.o $(BUILD_DIR)/context_switch.o $(BUILD_DIR)/syscall_asm.o
+C_OBJECTS = $(BUILD_DIR)/kernel.o $(BUILD_DIR)/multiboot2.o $(BUILD_DIR)/pmm.o $(BUILD_DIR)/paging.o $(BUILD_DIR)/kheap.o $(BUILD_DIR)/process.o $(BUILD_DIR)/vga.o $(BUILD_DIR)/pit.o $(BUILD_DIR)/keyboard.o $(BUILD_DIR)/idt.o $(BUILD_DIR)/interrupts.o $(BUILD_DIR)/syscall.o $(BUILD_DIR)/test_syscalls.o
 
 ALL_OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
 
@@ -102,7 +102,19 @@ $(BUILD_DIR)/context_switch.o: $(ARCH_DIR)/context_switch.asm | $(BUILD_DIR)
 	@echo "[AS] $<"
 	@$(AS) $(ASFLAGS) $< -o $@
 
+$(BUILD_DIR)/syscall_asm.o: $(KERNEL_DIR)/sys/syscall_asm.asm | $(BUILD_DIR)
+	@echo "[AS] $<"
+	@$(AS) $(ASFLAGS) $< -o $@
+
 $(BUILD_DIR)/process.o: $(KERNEL_DIR)/proc/process.c | $(BUILD_DIR)
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/sys/syscall.c | $(BUILD_DIR)
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/test_syscalls.o: $(KERNEL_DIR)/test_syscalls.c | $(BUILD_DIR)
 	@echo "[CC] $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
 

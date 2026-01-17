@@ -1,183 +1,300 @@
-// syscall.c - System call implementation
-// BlitzOS Syscall Handler
-
 #include "syscall.h"
 #include "../../drivers/vga.h"
 #include "../../drivers/pit.h"
 #include "../proc/process.h"
+#include "../arch/x86_64/idt.h"
 
-// ============================================================
-// SYSCALL IMPLEMENTATION
-// ============================================================
-
-// Rainbow colors for fun syscalls
-static const uint8_t rainbow_colors[] = {
-    VGA_COLOR_LIGHT_RED, VGA_COLOR_BROWN, VGA_COLOR_LIGHT_GREEN,
-    VGA_COLOR_LIGHT_CYAN, VGA_COLOR_LIGHT_BLUE, VGA_COLOR_LIGHT_MAGENTA
-};
-#define RAINBOW_COUNT 6
-
-// Simple random number (using timer ticks)
-static uint32_t simple_rand(void) {
-    static uint32_t seed = 12345;
-    seed = seed * 1103515245 + 12345;
-    return (seed / 65536) % 32768;
-}
-
-// ============================================================
-// CORE SYSCALLS
-// ============================================================
-
-// SYS_EXIT - Terminate current process
-static uint64_t sys_exit(uint64_t code) {
-    process_t* current = get_current_process();
-    if (current) {
-        vga_print("\n[EXIT] Process ", VGA_COLOR_LIGHT_RED);
-        vga_print(current->name, VGA_COLOR_LIGHT_RED);
-        vga_print(" exited with code ", VGA_COLOR_LIGHT_RED);
-        vga_print_int(code, VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
-        // Mark as terminated (scheduler will clean up)
-        current->state = PROCESS_TERMINATED;
-    }
-    // Yield to next process
-    do_schedule();
-    return 0;
-}
-
-// SYS_WRITE - Write to file descriptor (stdout only for now)
-static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
-    if (fd != STDOUT && fd != STDERR) {
-        return (uint64_t)-1;  // Invalid fd
+// Helper: Convert integer to string
+static void itoa(uint32_t value, char* buffer) {
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
     }
     
-    const char* str = (const char*)buf;
-    for (uint64_t i = 0; i < len && str[i]; i++) {
-        char c[2] = {str[i], '\0'};
-        vga_print(c, fd == STDERR ? VGA_COLOR_LIGHT_RED : VGA_COLOR_WHITE);
+    int i = 0;
+    while (value > 0) {
+        int remainder = value % 10;
+        buffer[i++] = '0' + remainder;
+        value /= 10;
     }
-    return len;
+    buffer[i] = '\0';
+    
+    // Reverse the string
+    int start = 0;
+    int end = i - 1;
+    while (start < end) {
+        char temp = buffer[start];
+        buffer[start] = buffer[end];
+        buffer[end] = temp;
+        start++;
+        end--;
+    }
 }
 
-// SYS_SLEEP - Sleep for milliseconds
-static uint64_t sys_sleep(uint64_t milliseconds) {
-    uint32_t ticks = (milliseconds + 9) / 10;  // Convert to 10ms ticks
+// I/O port functions
+static inline void outb(uint16_t port, uint8_t value) {
+    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+// Syscall entry point (assembly stub)
+extern void syscall_asm(void);
+
+// Initialize the syscall handler
+void syscall_init(void) {
+    // INT 0x80 is the traditional Linux syscall vector
+    // 0xEE = trap gate (allows user mode to call it)
+    idt_set_gate(0x80, (uint64_t)syscall_asm, 0x08, 0xEE);
+    vga_print("[SYSCALL] System call interface initialized (INT 0x80)\n", VGA_COLOR_LIGHT_GREEN);
+}
+
+// ============================================================
+// FUN SYSCALL IMPLEMENTATIONS
+// ============================================================
+
+// Beep: Generate a tone via PIT (Intel 8253)
+static void syscall_beep(uint32_t frequency, uint32_t duration_ticks) {
+    if (frequency == 0 || duration_ticks == 0) return;
+    
+    // PIT port for speaker control
+    #define PIT_SPEAKER_PORT 0x61
+    #define PIT_COUNTER_2    0x42
+    #define PIT_CONTROL      0x43
+    
+    // Calculate divisor for desired frequency
+    // PIT runs at 1.193182 MHz
+    uint16_t divisor = 1193182 / frequency;
+    
+    // Program counter 2 of PIT (speaker timer)
+    outb(PIT_CONTROL, 0xB6);  // Counter 2, both bytes, square wave
+    outb(PIT_COUNTER_2, divisor & 0xFF);
+    outb(PIT_COUNTER_2, (divisor >> 8) & 0xFF);
+    
+    // Enable speaker
+    uint8_t status = inb(PIT_SPEAKER_PORT);
+    outb(PIT_SPEAKER_PORT, status | 0x03);
+    
+    // Sleep for duration
+    pit_sleep(duration_ticks);
+    
+    // Disable speaker
+    status = inb(PIT_SPEAKER_PORT);
+    outb(PIT_SPEAKER_PORT, status & ~0x03);
+}
+
+// Print in rainbow colors
+static void syscall_print_rainbow(const char* text) {
+    if (!text) return;
+    
+    static const vga_color_t colors[] = {
+        VGA_COLOR_RED,
+        VGA_COLOR_LIGHT_RED,
+        VGA_COLOR_LIGHT_BROWN,
+        VGA_COLOR_LIGHT_GREEN,
+        VGA_COLOR_CYAN,
+        VGA_COLOR_LIGHT_BLUE,
+        VGA_COLOR_LIGHT_MAGENTA
+    };
+    static const int num_colors = 7;
+    
+    for (int i = 0; text[i]; i++) {
+        vga_putchar(text[i], colors[i % num_colors]);
+    }
+    vga_putchar('\n', VGA_COLOR_WHITE);
+}
+
+// Print cool ASCII style
+static void syscall_print_cool(const char* text) {
+    if (!text) return;
+    
+    vga_print("  ===== COOL TEXT =====  \n", VGA_COLOR_LIGHT_CYAN);
+    vga_print("  ", VGA_COLOR_LIGHT_CYAN);
+    vga_print(text, VGA_COLOR_LIGHT_BROWN);
+    vga_print(" \n", VGA_COLOR_LIGHT_CYAN);
+    vga_print("  =====================  \n", VGA_COLOR_LIGHT_CYAN);
+}
+
+// Screen blink effect
+static void syscall_screen_blink(uint32_t count, uint32_t speed_ticks) {
+    for (uint32_t i = 0; i < count; i++) {
+        vga_putchar('*', VGA_COLOR_WHITE);
+        pit_sleep(speed_ticks);
+    }
+    vga_putchar('\n', VGA_COLOR_WHITE);
+}
+
+// Party mode: random colors!
+static void syscall_party_mode(uint32_t duration_ticks) {
+    static const vga_color_t party_colors[] = {
+        VGA_COLOR_RED,
+        VGA_COLOR_LIGHT_RED,
+        VGA_COLOR_GREEN,
+        VGA_COLOR_LIGHT_GREEN,
+        VGA_COLOR_BLUE,
+        VGA_COLOR_LIGHT_BLUE,
+        VGA_COLOR_LIGHT_BROWN,
+        VGA_COLOR_LIGHT_MAGENTA,
+        VGA_COLOR_LIGHT_CYAN
+    };
+    
+    vga_print("PARTY TIME!  \n", VGA_COLOR_LIGHT_BROWN);
+    
+    uint32_t end_time = pit_get_ticks() + duration_ticks;
+    
+    while (pit_get_ticks() < end_time) {
+        static uint32_t seed = 12345;
+        seed = seed * 1103515245 + 12345;  // Simple LCG
+        
+        vga_color_t color = party_colors[(seed >> 16) % 9];
+        vga_putchar('*', color);
+        
+        pit_sleep(1);  // Sleep 1 tick at a time
+    }
+    
+    vga_print("\nParty over!\n", VGA_COLOR_WHITE);
+}
+
+// Cursor dance effect
+static void syscall_cursor_dance(uint32_t duration_ticks) {
+    uint32_t end_time = pit_get_ticks() + duration_ticks;
+    
+    const char dance_chars[] = "|/-\\";
+    int idx = 0;
+    
+    vga_print("Dancing: ", VGA_COLOR_LIGHT_GREEN);
+    
+    while (pit_get_ticks() < end_time) {
+        char c = dance_chars[idx % 4];
+        vga_putchar(c, VGA_COLOR_LIGHT_CYAN);
+        idx++;
+        pit_sleep(1);
+    }
+    
+    vga_print("\nDance complete!\n", VGA_COLOR_LIGHT_GREEN);
+}
+
+// ============================================================
+// CORE SYSCALL IMPLEMENTATIONS
+// ============================================================
+
+// Exit the current process
+static void syscall_exit(int code) {
+    (void)code;  // Suppress unused warning
+    process_t* current = get_current_process();
+    if (current) {
+        current->state = PROCESS_TERMINATED;
+    }
+    __asm__ volatile("hlt");
+}
+
+// Write to output (stdout/stderr)
+static int syscall_write(int fd, const char* buf, int len) {
+    if (!buf || len <= 0) return -1;
+    
+    if (fd == STDOUT || fd == STDERR) {
+        for (int i = 0; i < len && buf[i]; i++) {
+            vga_putchar(buf[i], VGA_COLOR_WHITE);
+        }
+        return len;
+    }
+    
+    return -1;  // Invalid file descriptor
+}
+
+// Read from input (not yet implemented)
+static int syscall_read(int fd, char* buf, int len) {
+    (void)fd;   // Suppress unused warning
+    (void)buf;  // Suppress unused warning
+    (void)len;  // Suppress unused warning
+    return -1;
+}
+
+// Sleep for ticks (not milliseconds!)
+static void syscall_sleep(uint32_t ticks) {
     pit_sleep(ticks);
-    return 0;
 }
 
-// SYS_GETPID - Get current process ID
-static uint64_t sys_getpid(void) {
+// Get current process ID
+static uint32_t syscall_getpid(void) {
     process_t* current = get_current_process();
     return current ? current->pid : 0;
 }
 
-// SYS_GETPPID - Get parent process ID
-static uint64_t sys_getppid(void) {
+// Get parent process ID
+static uint32_t syscall_getppid(void) {
     process_t* current = get_current_process();
     return current ? current->parent_pid : 0;
 }
 
 // ============================================================
-// FUN SYSCALLS 🎉
+// MAIN SYSCALL DISPATCHER
 // ============================================================
 
-// SYS_PRINT_RAINBOW - Print text in rainbow colors
-static uint64_t sys_print_rainbow(uint64_t buf) {
-    const char* str = (const char*)buf;
-    int color_idx = 0;
-    
-    while (*str) {
-        char c[2] = {*str, '\0'};
-        vga_print(c, rainbow_colors[color_idx % RAINBOW_COUNT]);
-        color_idx++;
-        str++;
-    }
-    return 0;
-}
-
-// SYS_PARTY_MODE - Random colors for duration
-static uint64_t sys_party_mode(uint64_t duration_ms) {
-    uint32_t end_tick = pit_get_ticks() + (duration_ms / 10);
-    const char* party_chars = "*!@#$%&";
-    
-    while (pit_get_ticks() < end_tick) {
-        uint32_t r = simple_rand();
-        uint8_t color = rainbow_colors[r % RAINBOW_COUNT];
-        char c[2] = {party_chars[r % 7], '\0'};
-        vga_print(c, color);
-        
-        for(volatile int i = 0; i < 50000; i++);
-    }
-    return 0;
-}
-
-// SYS_PRINT_COOL - Print text with cool effect
-static uint64_t sys_print_cool(uint64_t buf) {
-    const char* str = (const char*)buf;
-    
-    vga_print(">> ", VGA_COLOR_LIGHT_CYAN);
-    while (*str) {
-        char c[2] = {*str, '\0'};
-        vga_print(c, VGA_COLOR_LIGHT_GREEN);
-        for(volatile int i = 0; i < 30000; i++);  // Typing effect
-        str++;
-    }
-    vga_print(" <<", VGA_COLOR_LIGHT_CYAN);
-    return 0;
-}
-
-// SYS_SCREEN_BLINK - Blink effect (changes colors)
-static uint64_t sys_screen_blink(uint64_t count, uint64_t speed_ms) {
-    for (uint64_t i = 0; i < count; i++) {
-        vga_print("*", VGA_COLOR_WHITE);
-        pit_sleep(speed_ms / 10);
-        vga_print("\b ", VGA_COLOR_BLACK);  // Backspace effect
-        pit_sleep(speed_ms / 10);
-    }
-    return 0;
-}
-
-// ============================================================
-// SYSCALL DISPATCHER
-// ============================================================
-
-void syscall_init(void) {
-    vga_print("[SYSCALL] System calls initialized (INT 0x80)\n", VGA_COLOR_LIGHT_GREEN);
-}
-
-uint64_t syscall_handler(uint64_t rax, uint64_t rbx, uint64_t rcx,
+uint64_t syscall_handler(uint64_t rax, uint64_t rbx, uint64_t rcx, 
                          uint64_t rdx, uint64_t rsi, uint64_t rdi) {
-    (void)rsi;
-    (void)rdi;
+    (void)rsi;  // Suppress unused warning
+    (void)rdi;  // Suppress unused warning
+    uint32_t syscall_num = rax & 0xFFFFFFFF;
     
-    switch (rax) {
+    switch (syscall_num) {
         // Core syscalls
         case SYS_EXIT:
-            return sys_exit(rbx);
+            syscall_exit((int)rbx);
+            return 0;
+            
         case SYS_WRITE:
-            return sys_write(rbx, rcx, rdx);
+            return syscall_write((int)rbx, (const char*)rcx, (int)rdx);
+            
+        case SYS_READ:
+            return syscall_read((int)rbx, (char*)rcx, (int)rdx);
+            
         case SYS_SLEEP:
-            return sys_sleep(rbx);
+            syscall_sleep((uint32_t)rbx);
+            return 0;
+            
         case SYS_GETPID:
-            return sys_getpid();
+            return syscall_getpid();
+            
         case SYS_GETPPID:
-            return sys_getppid();
-        
-        // Fun syscalls 🎉
+            return syscall_getppid();
+            
+        // Fun syscalls!
+        case SYS_BEEP:
+            syscall_beep((uint32_t)rbx, (uint32_t)rcx);
+            return 0;
+            
         case SYS_PRINT_RAINBOW:
-            return sys_print_rainbow(rbx);
-        case SYS_PARTY_MODE:
-            return sys_party_mode(rbx);
-        case SYS_PRINT_COOL:
-            return sys_print_cool(rbx);
+            syscall_print_rainbow((const char*)rbx);
+            return 0;
+            
         case SYS_SCREEN_BLINK:
-            return sys_screen_blink(rbx, rcx);
-        
+            syscall_screen_blink((uint32_t)rbx, (uint32_t)rcx);
+            return 0;
+            
+        case SYS_PARTY_MODE:
+            syscall_party_mode((uint32_t)rbx);
+            return 0;
+            
+        case SYS_PRINT_COOL:
+            syscall_print_cool((const char*)rbx);
+            return 0;
+            
+        case SYS_CURSOR_DANCE:
+            syscall_cursor_dance((uint32_t)rbx);
+            return 0;
+            
         default:
-            vga_print("[SYSCALL] Unknown syscall: ", VGA_COLOR_LIGHT_RED);
-            vga_print_int(rax, VGA_COLOR_LIGHT_RED);
+            vga_print("[SYSCALL] Unknown: ", VGA_COLOR_LIGHT_RED);
+            char buf[10];
+            itoa(syscall_num, buf);
+            vga_print(buf, VGA_COLOR_LIGHT_RED);
             vga_print("\n", VGA_COLOR_WHITE);
-            return (uint64_t)-1;
+            return -1;
     }
 }
