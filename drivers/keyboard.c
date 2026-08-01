@@ -1,151 +1,329 @@
 #include "keyboard.h"
 #include "../kernel/arch/x86_64/interrupts.h"
+#include "../kernel/proc/process.h"
 
-// US QWERTY keyboard layout (scancode set 1)
-static const char keyboard_us[128] = {
-    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0, /* Ctrl */
-    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0, /* Left shift */
-    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
-    0, /* Right shift */
+// ---------------------------------------------------------------------------
+// Scancode set 1 -> ASCII
+// ---------------------------------------------------------------------------
+
+static const char keymap_normal[128] = {
+    0,   27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t','q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0,   /* 0x1D left ctrl */
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'','`',
+    0,   /* 0x2A left shift */
+    '\\','z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/',
+    0,   /* 0x36 right shift */
     '*',
-    0, /* Alt */
-    ' ', /* Space */
-    0, /* Caps lock */
-    0, /* F1 */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, /* F2-F10 */
-    0, /* Num lock */
-    0, /* Scroll lock */
-    0, /* Home */
-    0, /* Up arrow */
-    0, /* Page up */
-    '-',
-    0, /* Left arrow */
-    0,
-    0, /* Right arrow */
-    '+',
-    0, /* End */
-    0, /* Down arrow */
-    0, /* Page down */
-    0, /* Insert */
-    0, /* Delete */
+    0,   /* 0x38 left alt */
+    ' ',
+    0,   /* 0x3A caps lock */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   /* 0x3B-0x44 F1-F10 */
+    0,   /* 0x45 num lock */
+    0,   /* 0x46 scroll lock */
+    '7', '8', '9', '-',             /* keypad */
+    '4', '5', '6', '+',
+    '1', '2', '3',
+    '0', '.',
     0, 0, 0,
-    0, /* F11 */
-    0, /* F12 */
-    0, /* All other keys undefined */
+    0,   /* 0x57 F11 */
+    0,   /* 0x58 F12 */
+    /* remainder zero-filled */
 };
 
-// Shifted characters
-static const char keyboard_us_shifted[128] = {
-    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0, /* Ctrl */
+static const char keymap_shifted[128] = {
+    0,   27,  '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t','Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0,
     'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    0, /* Left shift */
+    0,
     '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?',
-    0, /* Right shift */
+    0,
     '*',
-    0, /* Alt */
-    ' ', /* Space */
-    0, /* Caps lock */
-    0, /* F1-F12 and other keys */
+    0,
+    ' ',
+    0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,
+    0,
+    '7', '8', '9', '-',
+    '4', '5', '6', '+',
+    '1', '2', '3',
+    '0', '.',
+    /* remainder zero-filled */
 };
 
-// Keyboard state
-static uint8_t shift_pressed = 0;
-static uint8_t ctrl_pressed = 0;
-static uint8_t alt_pressed = 0;
+// ---------------------------------------------------------------------------
+// Driver state
+// ---------------------------------------------------------------------------
 
-// Circular keyboard buffer
-static char kb_buffer[KB_BUFFER_SIZE];
-static volatile uint16_t kb_buffer_read = 0;
-static volatile uint16_t kb_buffer_write = 0;
+static uint8_t modifiers = 0;
+static uint8_t expecting_extended = 0;
 
-// Add character to keyboard buffer
-static void kb_buffer_add(char c) {
-    uint16_t next_write = (kb_buffer_write + 1) % KB_BUFFER_SIZE;
-    if (next_write != kb_buffer_read) {
-        kb_buffer[kb_buffer_write] = c;
-        kb_buffer_write = next_write;
+// Circular buffer of decoded keys. uint16_t because special keys (arrows, F
+// keys) are reported above the ASCII range.
+static volatile uint16_t kb_buffer[KB_BUFFER_SIZE];
+static volatile uint16_t kb_read  = 0;
+static volatile uint16_t kb_write = 0;
+
+static void kb_buffer_push(int key)
+{
+    uint16_t next = (uint16_t)((kb_write + 1) % KB_BUFFER_SIZE);
+
+    // Drop the keystroke rather than overwriting unread input.
+    if (next == kb_read) {
+        return;
+    }
+
+    kb_buffer[kb_write] = (uint16_t)key;
+    kb_write = next;
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard LEDs
+// ---------------------------------------------------------------------------
+
+static void kb_wait_input_clear(void)
+{
+    // Bounded, so a wedged controller cannot hang the kernel.
+    for (uint32_t i = 0; i < 100000; i++) {
+        if (!(inb(KB_STATUS_PORT) & KB_STATUS_INPUT_FULL)) {
+            return;
+        }
     }
 }
 
-// Initialize keyboard
-void keyboard_init(void) {
-    // Clear buffer
-    kb_buffer_read = 0;
-    kb_buffer_write = 0;
-    
-    // Keyboard is already initialized by BIOS/GRUB
-    // Just clear any pending data
+static void keyboard_update_leds(void)
+{
+    uint8_t leds = 0;
+    if (modifiers & KB_MOD_CAPS) {
+        leds |= 0x04;  // caps lock LED
+    }
+
+    kb_wait_input_clear();
+    outb(KB_DATA_PORT, 0xED);   // "set LEDs" command
+    kb_wait_input_clear();
+    outb(KB_DATA_PORT, leds);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+void keyboard_init(void)
+{
+    kb_read   = 0;
+    kb_write  = 0;
+    modifiers = 0;
+    expecting_extended = 0;
+
+    // Drain anything the firmware left in the output buffer, otherwise the
+    // first IRQ delivers a stale byte.
     while (inb(KB_STATUS_PORT) & KB_STATUS_OUTPUT_FULL) {
-        inb(KB_DATA_PORT);
+        (void)inb(KB_DATA_PORT);
+    }
+
+    keyboard_update_leds();
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt handler
+// ---------------------------------------------------------------------------
+
+// Map an extended (0xE0-prefixed) scancode to a KEY_* value.
+static int decode_extended(uint8_t scancode)
+{
+    switch (scancode) {
+    case 0x48: return KEY_ARROW_UP;
+    case 0x50: return KEY_ARROW_DOWN;
+    case 0x4B: return KEY_ARROW_LEFT;
+    case 0x4D: return KEY_ARROW_RIGHT;
+    case 0x47: return KEY_HOME;
+    case 0x4F: return KEY_END;
+    case 0x49: return KEY_PAGE_UP;
+    case 0x51: return KEY_PAGE_DOWN;
+    case 0x52: return KEY_INSERT;
+    case 0x53: return KEY_DELETE;
+    case 0x1C: return '\n';   // keypad enter
+    case 0x35: return '/';    // keypad slash
+    default:   return KEY_NONE;
     }
 }
 
-// Keyboard interrupt handler (IRQ1)
-void keyboard_handler(void) {
+void keyboard_handler(void)
+{
     uint8_t scancode = inb(KB_DATA_PORT);
-    
-    // Check if key release (bit 7 set)
-    if (scancode & 0x80) {
-        // Key released
-        scancode &= 0x7F;
-        
-        // Update modifier keys
-        if (scancode == KEY_LSHIFT || scancode == KEY_RSHIFT) {
-            shift_pressed = 0;
-        } else if (scancode == KEY_LCTRL) {
-            ctrl_pressed = 0;
-        } else if (scancode == KEY_LALT) {
-            alt_pressed = 0;
-        }
-    } else {
-        // Key pressed
-        
-        // Update modifier keys
-        if (scancode == KEY_LSHIFT || scancode == KEY_RSHIFT) {
-            shift_pressed = 1;
-            return;
-        } else if (scancode == KEY_LCTRL) {
-            ctrl_pressed = 1;
-            return;
-        } else if (scancode == KEY_LALT) {
-            alt_pressed = 1;
+
+    // 0xE0 introduces a two-byte sequence; remember it and take the next byte.
+    if (scancode == KB_EXTENDED_PREFIX) {
+        expecting_extended = 1;
+        return;
+    }
+
+    int is_release = (scancode & 0x80) != 0;
+    uint8_t code   = (uint8_t)(scancode & 0x7F);
+
+    if (expecting_extended) {
+        expecting_extended = 0;
+
+        if (code == KEY_LCTRL) {          // right ctrl
+            if (is_release) modifiers &= (uint8_t)~KB_MOD_CTRL;
+            else            modifiers |= KB_MOD_CTRL;
             return;
         }
-        
-        // Convert scancode to ASCII
-        char c = 0;
-        if (shift_pressed) {
-            c = keyboard_us_shifted[scancode];
-        } else {
-            c = keyboard_us[scancode];
+        if (code == KEY_LALT) {           // right alt
+            if (is_release) modifiers &= (uint8_t)~KB_MOD_ALT;
+            else            modifiers |= KB_MOD_ALT;
+            return;
         }
-        
-        // Add to buffer if valid character
-        if (c != 0) {
-            kb_buffer_add(c);
+
+        if (!is_release) {
+            int key = decode_extended(code);
+            if (key != KEY_NONE) {
+                kb_buffer_push(key);
+                process_wake_all(WAIT_CHANNEL_KEYBOARD);
+            }
         }
+        return;
+    }
+
+    // ---- Modifier keys ----
+    switch (code) {
+    case KEY_LSHIFT:
+    case KEY_RSHIFT:
+        if (is_release) modifiers &= (uint8_t)~KB_MOD_SHIFT;
+        else            modifiers |= KB_MOD_SHIFT;
+        return;
+
+    case KEY_LCTRL:
+        if (is_release) modifiers &= (uint8_t)~KB_MOD_CTRL;
+        else            modifiers |= KB_MOD_CTRL;
+        return;
+
+    case KEY_LALT:
+        if (is_release) modifiers &= (uint8_t)~KB_MOD_ALT;
+        else            modifiers |= KB_MOD_ALT;
+        return;
+
+    case KEY_CAPSLOCK:
+        // Toggle on press only, otherwise the release flips it straight back.
+        if (!is_release) {
+            modifiers ^= KB_MOD_CAPS;
+            keyboard_update_leds();
+        }
+        return;
+
+    default:
+        break;
+    }
+
+    if (is_release) {
+        return;  // nothing else cares about key-up
+    }
+
+    // ---- Function keys ----
+    if (code >= KEY_F1 && code <= KEY_F1 + 9) {
+        kb_buffer_push(KEY_FKEY_BASE + (code - KEY_F1));
+        process_wake_all(WAIT_CHANNEL_KEYBOARD);
+        return;
+    }
+
+    // ---- Printable characters ----
+    int shifted = (modifiers & KB_MOD_SHIFT) != 0;
+    char c = shifted ? keymap_shifted[code] : keymap_normal[code];
+
+    if (c == 0) {
+        return;
+    }
+
+    // Caps lock inverts the shift state for letters only, not for digits or
+    // punctuation - which is why it cannot just be OR'd into `shifted`.
+    if (modifiers & KB_MOD_CAPS) {
+        if (c >= 'a' && c <= 'z')      c = (char)(c - 32);
+        else if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+    }
+
+    // Ctrl+letter produces the classic control character: Ctrl+C = 0x03,
+    // Ctrl+L = 0x0C, and so on.
+    if (modifiers & KB_MOD_CTRL) {
+        if (c >= 'a' && c <= 'z')      c = (char)(c - 'a' + 1);
+        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
+    }
+
+    kb_buffer_push((unsigned char)c);
+
+    // Wake anything blocked on keyboard input. This is what turns the shell's
+    // read from a spin loop into a real blocking wait.
+    process_wake_all(WAIT_CHANNEL_KEYBOARD);
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+int keyboard_has_input(void)
+{
+    return kb_read != kb_write;
+}
+
+int keyboard_getkey_nonblocking(void)
+{
+    uint64_t flags = irq_save();
+
+    if (kb_read == kb_write) {
+        irq_restore(flags);
+        return KEY_NONE;
+    }
+
+    int key = kb_buffer[kb_read];
+    kb_read = (uint16_t)((kb_read + 1) % KB_BUFFER_SIZE);
+
+    irq_restore(flags);
+    return key;
+}
+
+int keyboard_getkey(void)
+{
+    for (;;) {
+        int key = keyboard_getkey_nonblocking();
+        if (key != KEY_NONE) {
+            return key;
+        }
+
+        // Nothing buffered: give the CPU to someone else until IRQ1 fires.
+        process_block(WAIT_CHANNEL_KEYBOARD);
     }
 }
 
-// Check if keyboard buffer has data
-int keyboard_has_input(void) {
-    return kb_buffer_read != kb_buffer_write;
+char keyboard_getchar(void)
+{
+    for (;;) {
+        int key = keyboard_getkey();
+        if (key > 0 && key < 0x100) {
+            return (char)key;
+        }
+        // Arrow / function key: not representable as a char, so keep waiting.
+    }
 }
 
-// Read character from keyboard buffer (blocking)
-char keyboard_getchar(void) {
-    // Wait for input
-    while (!keyboard_has_input()) {
-        __asm__ volatile("hlt");
+uint8_t keyboard_get_modifiers(void)
+{
+    return modifiers;
+}
+
+void keyboard_flush(void)
+{
+    uint64_t flags = irq_save();
+    kb_read = kb_write;
+    irq_restore(flags);
+}
+
+void keyboard_inject_key(int key)
+{
+    if (key == KEY_NONE) {
+        return;
     }
-    
-    // Read from buffer
-    char c = kb_buffer[kb_buffer_read];
-    kb_buffer_read = (kb_buffer_read + 1) % KB_BUFFER_SIZE;
-    return c;
+
+    kb_buffer_push(key);
+    process_wake_all(WAIT_CHANNEL_KEYBOARD);
 }

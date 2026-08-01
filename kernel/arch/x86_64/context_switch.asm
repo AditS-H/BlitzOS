@@ -1,58 +1,53 @@
-; Save and restore CPU context for process switching
-; This is critical for multitasking!
+; context_switch.asm - Save and restore CPU context for process switching.
+;
+; void context_switch_asm(process_t* current, process_t* next)
+;   RDI = process to save into (may be NULL: "nothing to save")
+;   RSI = process to resume
+;
+; The saved context lives at offset 0 of process_t (cpu_context_t). process.c
+; carries _Static_asserts that pin these offsets, so reordering the C struct
+; breaks the build instead of silently corrupting RSP at runtime.
 
 global context_switch_asm
 
-; Offsets in process_t structure (must match process.h!)
-; Process_t layout:
-;   uint32_t pid;        // 0
-;   uint32_t parent_pid; // 4
-;   char name[32];       // 8
-;   uint32_t state;      // 40
-;   padding              // 44
-;   registers struct     // 48 <- registers start here!
-
-REGS_BASE    equ 48
-
-OFFSET_RAX   equ REGS_BASE + 0
-OFFSET_RBX   equ REGS_BASE + 8
-OFFSET_RCX   equ REGS_BASE + 16
-OFFSET_RDX   equ REGS_BASE + 24
-OFFSET_RSI   equ REGS_BASE + 32
-OFFSET_RDI   equ REGS_BASE + 40
-OFFSET_RBP   equ REGS_BASE + 48
-OFFSET_RSP   equ REGS_BASE + 56
-OFFSET_R8    equ REGS_BASE + 64
-OFFSET_R9    equ REGS_BASE + 72
-OFFSET_R10   equ REGS_BASE + 80
-OFFSET_R11   equ REGS_BASE + 88
-OFFSET_R12   equ REGS_BASE + 96
-OFFSET_R13   equ REGS_BASE + 104
-OFFSET_R14   equ REGS_BASE + 112
-OFFSET_R15   equ REGS_BASE + 120
-OFFSET_RIP   equ REGS_BASE + 128
-OFFSET_RFLAGS equ REGS_BASE + 136
+OFFSET_RAX    equ 0
+OFFSET_RBX    equ 8
+OFFSET_RCX    equ 16
+OFFSET_RDX    equ 24
+OFFSET_RSI    equ 32
+OFFSET_RDI    equ 40
+OFFSET_RBP    equ 48
+OFFSET_RSP    equ 56
+OFFSET_R8     equ 64
+OFFSET_R9     equ 72
+OFFSET_R10    equ 80
+OFFSET_R11    equ 88
+OFFSET_R12    equ 96
+OFFSET_R13    equ 104
+OFFSET_R14    equ 112
+OFFSET_R15    equ 120
+OFFSET_RIP    equ 128
+OFFSET_RFLAGS equ 136
 
 section .text
 bits 64
 
-; void context_switch_asm(process_t* current, process_t* next)
-; RDI = pointer to current process_t structure (to save into)
-; RSI = pointer to next process_t structure (to load from)
 context_switch_asm:
-    ; Save current process state (if current != NULL)
+    ; Capture RFLAGS before anything else. The TEST below overwrites ZF, and we
+    ; would end up saving the comparison result instead of the real flags.
+    pushfq                              ; RSP = entry_rsp - 8
+
     test rdi, rdi
-    jz load_next  ; Skip saving if current is NULL
-    
-    ; Save all registers to current process
+    jz .no_save
+
+    ; ---- Save the outgoing process ----
     mov [rdi + OFFSET_RAX], rax
     mov [rdi + OFFSET_RBX], rbx
     mov [rdi + OFFSET_RCX], rcx
     mov [rdi + OFFSET_RDX], rdx
     mov [rdi + OFFSET_RSI], rsi
-    mov [rdi + OFFSET_RDI], rdi
+    mov [rdi + OFFSET_RDI], rdi         ; caller-saved in SysV; stored for completeness
     mov [rdi + OFFSET_RBP], rbp
-    mov [rdi + OFFSET_RSP], rsp
     mov [rdi + OFFSET_R8],  r8
     mov [rdi + OFFSET_R9],  r9
     mov [rdi + OFFSET_R10], r10
@@ -61,19 +56,44 @@ context_switch_asm:
     mov [rdi + OFFSET_R13], r13
     mov [rdi + OFFSET_R14], r14
     mov [rdi + OFFSET_R15], r15
-    
-    ; Save RIP (return address from this function)
+
+    ; RAX is already saved, so it is free to use as scratch from here.
+    pop rax                             ; RAX = caller's RFLAGS, RSP = entry_rsp
+    mov [rdi + OFFSET_RFLAGS], rax
+
+    ; Resume point = our return address.
     mov rax, [rsp]
     mov [rdi + OFFSET_RIP], rax
-    
-load_next:
-    ; Load next process state from RSI
+
+    ; Save the stack pointer as it will be *after* returning, i.e. entry_rsp+8.
+    ;
+    ; The previous version saved entry_rsp instead, which left the stale return
+    ; address on the stack after every resume. That leaked 8 bytes per context
+    ; switch - roughly 2000 switches (20 seconds at 100 Hz) before a kernel
+    ; stack silently overflowed into whatever was allocated below it.
+    lea rax, [rsp + 8]
+    mov [rdi + OFFSET_RSP], rax
+
+    jmp .load
+
+.no_save:
+    add rsp, 8                          ; discard the RFLAGS we pushed
+
+.load:
+    ; ---- Restore the incoming process ----
+    ; RSI still points at `next`, so it must be loaded last.
+    mov rsp, [rsi + OFFSET_RSP]
+
+    ; Stage [RFLAGS][RIP] on the new stack. Net stack effect of
+    ; push/push/popfq/ret is zero, so we land with RSP exactly as saved.
+    push qword [rsi + OFFSET_RIP]
+    push qword [rsi + OFFSET_RFLAGS]
+
     mov rax, [rsi + OFFSET_RAX]
     mov rbx, [rsi + OFFSET_RBX]
     mov rcx, [rsi + OFFSET_RCX]
     mov rdx, [rsi + OFFSET_RDX]
     mov rbp, [rsi + OFFSET_RBP]
-    mov rsp, [rsi + OFFSET_RSP]
     mov r8,  [rsi + OFFSET_R8]
     mov r9,  [rsi + OFFSET_R9]
     mov r10, [rsi + OFFSET_R10]
@@ -82,15 +102,16 @@ load_next:
     mov r13, [rsi + OFFSET_R13]
     mov r14, [rsi + OFFSET_R14]
     mov r15, [rsi + OFFSET_R15]
-    
-    ; Load RDI and RSI last
-    mov rdi, [rsi + OFFSET_RDI]
-    push qword [rsi + OFFSET_RIP]  ; Push return address
-    mov rsi, [rsi + OFFSET_RSI]
-    
-    ; Enable interrupts
-    sti
-    
-    ; Jump to next process (RIP is on stack)
-    ret
 
+    mov rdi, [rsi + OFFSET_RDI]
+    mov rsi, [rsi + OFFSET_RSI]         ; RSI dies here - must be the last load
+
+    ; POPFQ restores the interrupt flag exactly as the target process left it.
+    ; The old code did an unconditional STI, which re-enabled interrupts even
+    ; when switching into a critical section.
+    ;
+    ; If an interrupt fires in the one-instruction window between POPFQ and RET,
+    ; the stack is already well formed (return address on top), so the handler
+    ; nests and returns harmlessly.
+    popfq
+    ret

@@ -12,26 +12,6 @@ static inline uint64_t pdpt_index(uint64_t virt) { return (virt >> 30) & 0x1FF; 
 static inline uint64_t pd_index(uint64_t virt)   { return (virt >> 21) & 0x1FF; }
 static inline uint64_t pt_index(uint64_t virt)   { return (virt >> 12) & 0x1FF; }
 
-// Helper to convert number to string
-static void uint64_to_str(uint64_t num, char* buf) {
-    if (num == 0) {
-        buf[0] = '0';
-        buf[1] = '\0';
-        return;
-    }
-    char temp[32];
-    int i = 0;
-    while (num > 0) {
-        temp[i++] = '0' + (num % 10);
-        num /= 10;
-    }
-    int j = 0;
-    while (i > 0) {
-        buf[j++] = temp[--i];
-    }
-    buf[j] = '\0';
-}
-
 // Get or create page table
 static page_table_t* get_or_create_table(pte_t* entry, uint64_t flags) {
     if (*entry & PAGE_PRESENT) {

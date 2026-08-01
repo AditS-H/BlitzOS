@@ -1,486 +1,735 @@
+// process.c - Process table, ready queue, and the preemptive scheduler.
+//
+// How preemption works here:
+//
+//   1. The PIT fires IRQ0 at 100 Hz. The assembly stub saves every register
+//      onto the *current process's* kernel stack and calls irq_handler().
+//   2. irq_handler() calls scheduler_tick(), which ages priorities, wakes
+//      sleepers, and decrements the running process's quantum. When the
+//      quantum hits zero it raises need_reschedule.
+//   3. irq_handler() acknowledges the PIC (EOI) and then, still with
+//      interrupts disabled, calls schedule().
+//   4. schedule() calls context_switch_asm(), which swaps RSP to the next
+//      process's stack and returns into *its* copy of irq_handler.
+//   5. That process's irq_handler returns into its own interrupt stub, which
+//      pops its registers and IRETQs back to whatever it was doing.
+//
+// The half-finished interrupt frame simply waits on each process's stack
+// until that process is scheduled again. EOI is sent *before* the switch,
+// otherwise the PIC would stay masked and the timer would never fire again.
+
 #include "process.h"
-#include "../../drivers/vga.h"
+#include "../lib/kprintf.h"
+#include "../lib/string.h"
 #include "../mm/kheap.h"
+#include "../core/panic.h"
+#include "../arch/x86_64/interrupts.h"
+#include "../../drivers/vga.h"
 
-// Port I/O for EOI
-static inline void outb(uint16_t port, uint8_t value) {
-    __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
-}
+// ---------------------------------------------------------------------------
+// Scheduler state
+// ---------------------------------------------------------------------------
 
-// String utilities
-static inline void strncpy_safe(char* dest, const char* src, size_t n)
-{
-    for (size_t i = 0; i < n && src[i] != '\0'; i++) {
-        dest[i] = src[i];
-    }
-    dest[n-1] = '\0';
-}
+typedef struct {
+    process_t* ready_head;
+    process_t* ready_tail;
+    process_t* current;
+    uint32_t   next_pid;
+    uint32_t   process_count;
+    uint64_t   total_ticks;
+    uint64_t   context_switches;
+    uint64_t   last_aging_tick;
+} scheduler_t;
 
-static inline int snprintf_safe(char* buf, size_t size, const char* fmt, uint32_t val)
-{
-    // Simple version: just handles "proc_%u"
-    const char prefix[] = "proc_";
-    const char* p = prefix;
-    size_t i = 0;
-    
-    while (i < size - 1 && *p) {
-        buf[i++] = *p++;
-    }
-    
-    // Convert number to string
-    uint32_t digits[10];
-    int digit_count = 0;
-    uint32_t temp = val;
-    
-    if (temp == 0) {
-        digits[digit_count++] = 0;
-    } else {
-        while (temp > 0) {
-            digits[digit_count++] = temp % 10;
-            temp /= 10;
-        }
-    }
-    
-    for (int j = digit_count - 1; j >= 0 && i < size - 1; j--) {
-        buf[i++] = '0' + digits[j];
-    }
-    
-    buf[i] = '\0';
-    return i;
-}
+static scheduler_t sched;
 
-// Global scheduler state
-static scheduler_t scheduler = {0};
-static process_t process_table[MAX_PROCESSES] = {0};
+// Every live process, for `ps`, sleep scanning and priority aging. Slot i is
+// NULL when free. This replaces the unused process_table[] that used to sit
+// here doing nothing.
+static process_t* all_processes[MAX_PROCESSES];
 
-// Flag to indicate reschedule is needed
+// The idle process lives in .bss rather than the heap: it must exist before
+// anything else can run, and it must never fail to allocate.
+static process_t idle_process;
+static uint8_t   idle_stack[PROCESS_STACK_SIZE] __attribute__((aligned(16)));
+
 volatile uint8_t need_reschedule = 0;
 
-/**
- * Initialize the scheduler
- */
-void scheduler_init(void)
-{
-    scheduler.ready_queue_head = NULL;
-    scheduler.ready_queue_tail = NULL;
-    scheduler.current_process = NULL;
-    scheduler.next_pid = 1;  // PID 0 reserved for idle
-    scheduler.process_count = 0;
-    scheduler.total_ticks = 0;
-    
-    vga_print("[SCHED] Scheduler initialized", VGA_COLOR_LIGHT_GREEN);
-    vga_print("\n", VGA_COLOR_WHITE);
-}
+// ---------------------------------------------------------------------------
+// Layout guards
+//
+// context_switch.asm reads the saved registers at fixed byte offsets. If
+// anyone reorders process_t or cpu_context_t, the kernel would not crash - it
+// would silently restore garbage into RSP, which is far worse. These asserts
+// turn that into a build failure.
+// ---------------------------------------------------------------------------
 
-/**
- * Enqueue a process to the ready queue
- */
-static void queue_enqueue(process_t* proc)
+_Static_assert(offsetof(process_t, registers) == 0,
+               "context_switch.asm requires registers at offset 0 of process_t");
+_Static_assert(offsetof(cpu_context_t, rsp) == 56,
+               "context_switch.asm OFFSET_RSP is 56");
+_Static_assert(offsetof(cpu_context_t, rip) == 128,
+               "context_switch.asm OFFSET_RIP is 128");
+_Static_assert(offsetof(cpu_context_t, rflags) == 136,
+               "context_switch.asm OFFSET_RFLAGS is 136");
+_Static_assert(sizeof(cpu_context_t) == 144, "cpu_context_t must be 18 qwords");
+
+// ---------------------------------------------------------------------------
+// Ready queue (intrusive doubly-linked list)
+// ---------------------------------------------------------------------------
+
+static void queue_push_back(process_t* proc)
 {
-    if (!proc) return;
-    
     proc->next = NULL;
-    
-    if (scheduler.ready_queue_tail == NULL) {
-        // Queue is empty
-        scheduler.ready_queue_head = proc;
-        scheduler.ready_queue_tail = proc;
-        proc->prev = NULL;
+    proc->prev = sched.ready_tail;
+
+    if (sched.ready_tail) {
+        sched.ready_tail->next = proc;
     } else {
-        // Add to end
-        proc->prev = scheduler.ready_queue_tail;
-        scheduler.ready_queue_tail->next = proc;
-        scheduler.ready_queue_tail = proc;
+        sched.ready_head = proc;
     }
+    sched.ready_tail = proc;
 }
 
-/**
- * Dequeue a process from the ready queue
- */
-static process_t* queue_dequeue(void)
+static void queue_remove(process_t* proc)
 {
-    if (scheduler.ready_queue_head == NULL) {
-        return NULL;
+    if (proc->prev) {
+        proc->prev->next = proc->next;
+    } else if (sched.ready_head == proc) {
+        sched.ready_head = proc->next;
     }
-    
-    process_t* proc = scheduler.ready_queue_head;
-    scheduler.ready_queue_head = proc->next;
-    
-    if (scheduler.ready_queue_head == NULL) {
-        scheduler.ready_queue_tail = NULL;
-    } else {
-        scheduler.ready_queue_head->prev = NULL;
+
+    if (proc->next) {
+        proc->next->prev = proc->prev;
+    } else if (sched.ready_tail == proc) {
+        sched.ready_tail = proc->prev;
     }
-    
+
     proc->next = NULL;
     proc->prev = NULL;
-    
-    return proc;
 }
 
-/**
- * Create a new process
- * Returns NULL if failed (out of memory or max processes reached)
- */
+// True if `proc` is currently linked into the ready queue.
+static int queue_contains(process_t* proc)
+{
+    return proc->prev != NULL || proc->next != NULL || sched.ready_head == proc;
+}
+
+// Highest effective priority wins. Ties go to whoever is earliest in the
+// list, which preserves round-robin fairness inside a priority level.
+static process_t* pick_highest_ready(void)
+{
+    process_t* best = NULL;
+
+    for (process_t* p = sched.ready_head; p; p = p->next) {
+        if (!best || p->priority > best->priority) {
+            best = p;
+        }
+    }
+    return best;
+}
+
+// Higher priority processes get a slightly longer quantum: 5 ticks (50 ms) at
+// the bottom, 8 ticks (80 ms) at the top.
+static uint32_t process_quantum_for(const process_t* proc)
+{
+    if (proc == &idle_process) {
+        return 1;
+    }
+    return TIME_SLICE_TICKS + (proc->base_priority / 64);
+}
+
+// ---------------------------------------------------------------------------
+// Process table helpers
+// ---------------------------------------------------------------------------
+
+static int table_insert(process_t* proc)
+{
+    for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
+        if (all_processes[i] == NULL) {
+            all_processes[i] = proc;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+process_t* process_at_index(uint32_t index)
+{
+    if (index >= MAX_PROCESSES) {
+        return NULL;
+    }
+    return all_processes[index];
+}
+
+const char* process_state_name(process_state_t state)
+{
+    switch (state) {
+    case PROCESS_READY:      return "READY";
+    case PROCESS_RUNNING:    return "RUNNING";
+    case PROCESS_WAITING:    return "BLOCKED";
+    case PROCESS_SLEEPING:   return "SLEEPING";
+    case PROCESS_TERMINATED: return "ZOMBIE";
+    default:                 return "UNKNOWN";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The idle process
+//
+// Guarantees there is always something to run. Without it, an empty ready
+// queue used to print "[ERR] No processes ready!" and fall over.
+// ---------------------------------------------------------------------------
+
+static void idle_thread(void)
+{
+    for (;;) {
+        // Reclaim exited processes here: a process cannot free the stack it
+        // is standing on, so the actual kfree() is deferred to idle.
+        scheduler_reap();
+
+        // Sleep the CPU until the next interrupt. Without HLT this loop would
+        // peg a real core (and your laptop fan) at 100%.
+        __asm__ volatile("hlt");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stack setup
+// ---------------------------------------------------------------------------
+
+// Runs if a process function returns instead of calling exit(). Without this
+// the `ret` would jump to whatever garbage was on the fresh stack.
+static void process_thread_exit(void)
+{
+    process_exit(0);
+}
+
+// Prepares `proc` to be started by context_switch_asm().
+static void process_setup_context(process_t* proc, void* stack_base,
+                                  void (*entry)(void))
+{
+    // Zero the whole context. The old code left rbx/rcx/r8-r15 holding
+    // whatever was in the heap block, and restored that garbage into the CPU
+    // the first time the process ran.
+    memset(&proc->registers, 0, sizeof(proc->registers));
+
+    uint64_t top = ((uint64_t)stack_base + PROCESS_STACK_SIZE) & ~0xFULL;
+
+    // Plant the exit trampoline as the entry function's return address, so
+    // `ret` from a process body lands somewhere sane.
+    uint64_t* sp = (uint64_t*)top;
+    *(--sp) = (uint64_t)process_thread_exit;
+
+    proc->kernel_stack     = stack_base;
+    proc->kernel_stack_top = (void*)top;
+
+    proc->registers.rsp = (uint64_t)sp;
+    proc->registers.rbp = 0;              // terminates stack traces cleanly
+    proc->registers.rip = (uint64_t)entry;
+
+    // 0x202 = IF (interrupts enabled) plus the always-set bit 1. Restored via
+    // POPFQ by the context switcher, so a resumed process gets interrupts back
+    // exactly as it left them.
+    proc->registers.rflags = 0x202;
+
+    // System V requires RSP % 16 == 8 on entry to a function (as if a CALL had
+    // just pushed a return address). `top` is 16-aligned and we pushed one
+    // qword, so this holds by construction - but assert it, because a
+    // misaligned stack produces bizarre faults much later.
+    KASSERT((proc->registers.rsp % 16) == 8);
+}
+
+// ---------------------------------------------------------------------------
+// Initialisation
+// ---------------------------------------------------------------------------
+
+void scheduler_init(void)
+{
+    memset(&sched, 0, sizeof(sched));
+    memset(all_processes, 0, sizeof(all_processes));
+
+    sched.next_pid = 1;  // PID 0 is reserved for idle
+
+    // Build the idle process by hand: no heap, never queued, never killable.
+    memset(&idle_process, 0, sizeof(idle_process));
+    idle_process.pid           = 0;
+    idle_process.parent_pid    = 0;
+    strlcpy(idle_process.name, "idle", PROCESS_NAME_MAX);
+    idle_process.state         = PROCESS_READY;
+    idle_process.base_priority = PRIORITY_IDLE;
+    idle_process.priority      = PRIORITY_IDLE;
+    idle_process.page_table    = NULL;
+    process_setup_context(&idle_process, idle_stack, idle_thread);
+    idle_process.time_slice_remaining = 1;
+
+    all_processes[0] = &idle_process;
+    sched.process_count = 1;
+
+    kok("Scheduler ready: preemptive, priority-based, %u process slots\n",
+        (uint32_t)MAX_PROCESSES);
+}
+
+// ---------------------------------------------------------------------------
+// Creation
+// ---------------------------------------------------------------------------
+
 process_t* process_create(const char* name, void (*entry)(void), uint32_t priority)
 {
-    if (scheduler.process_count >= MAX_PROCESSES) {
-        vga_print("[ERR] Max processes reached", VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
+    if (!entry) {
+        kerror("process_create: NULL entry point\n");
         return NULL;
     }
-    
-    // Allocate process structure
+
+    if (priority > 255) {
+        priority = 255;
+    }
+
+    uint64_t flags = irq_save();
+
+    if (sched.process_count >= MAX_PROCESSES) {
+        irq_restore(flags);
+        kerror("process_create: process table full (%u)\n",
+               (uint32_t)MAX_PROCESSES);
+        return NULL;
+    }
+
     process_t* proc = (process_t*)kmalloc(sizeof(process_t));
     if (!proc) {
-        vga_print("[ERR] Failed to allocate process", VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
+        irq_restore(flags);
+        kerror("process_create: out of memory for TCB\n");
         return NULL;
     }
-    
-    // Initialize process fields
-    proc->pid = scheduler.next_pid++;
-    proc->parent_pid = scheduler.current_process ? scheduler.current_process->pid : 0;
-    
-    if (name) {
-        strncpy_safe(proc->name, name, sizeof(proc->name));
+
+    // kmalloc does not zero. Everything below depends on a clean slate.
+    memset(proc, 0, sizeof(process_t));
+
+    void* stack = kmalloc(PROCESS_STACK_SIZE);
+    if (!stack) {
+        kfree(proc);
+        irq_restore(flags);
+        kerror("process_create: out of memory for kernel stack\n");
+        return NULL;
+    }
+
+    proc->pid        = sched.next_pid++;
+    proc->parent_pid = sched.current ? sched.current->pid : 0;
+
+    if (name && name[0]) {
+        strlcpy(proc->name, name, PROCESS_NAME_MAX);
     } else {
-        snprintf_safe(proc->name, sizeof(proc->name), "proc_%u", proc->pid);
+        ksnprintf(proc->name, PROCESS_NAME_MAX, "proc_%u", proc->pid);
     }
-    
-    // State
-    proc->state = PROCESS_READY;
-    proc->priority = priority;
-    proc->time_slice_remaining = TIME_SLICE_TICKS;
-    proc->total_ticks = 0;
-    proc->wake_time = 0;
-    
-    // Allocate stacks
-    proc->kernel_stack = kmalloc(PROCESS_STACK_SIZE);
-    if (!proc->kernel_stack) {
+
+    proc->state                = PROCESS_READY;
+    proc->exit_code            = 0;
+    proc->base_priority        = priority;
+    proc->priority             = priority;
+    proc->total_ticks          = 0;
+    proc->ready_since          = sched.total_ticks;
+    proc->wake_time            = 0;
+    proc->wait_channel         = WAIT_CHANNEL_NONE;
+    proc->page_table           = NULL;   // shares the kernel address space
+    proc->user_stack           = NULL;   // allocated when ring 3 lands
+
+    process_setup_context(proc, stack, entry);
+    proc->time_slice_remaining = process_quantum_for(proc);
+
+    if (!table_insert(proc)) {
+        kfree(stack);
         kfree(proc);
-        vga_print("[ERR] Failed to allocate kernel stack", VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
+        irq_restore(flags);
+        kerror("process_create: process table full\n");
         return NULL;
     }
-    
-    proc->user_stack = kmalloc(PROCESS_STACK_SIZE);
-    if (!proc->user_stack) {
-        kfree(proc->kernel_stack);
-        kfree(proc);
-        vga_print("[ERR] Failed to allocate user stack", VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
-        return NULL;
-    }
-    
-    // Initialize stack pointers to top of stacks
-    proc->kernel_stack_top = (void*)((uint64_t)proc->kernel_stack + PROCESS_STACK_SIZE);
-    
-    // Set up initial stack frame for interrupt return
-    // When preempt_handler returns this stack pointer, iretq will pop:
-    // SS, RSP, RFLAGS, CS, RIP (in that order)
-    uint64_t* stack = (uint64_t*)proc->kernel_stack_top;
-    
-    // Build stack frame (working backwards from top)
-    stack--;  *stack = 0x10;           // SS (data segment)
-    stack--;  *stack = (uint64_t)proc->kernel_stack_top;  // RSP
-    stack--;  *stack = 0x202;          // RFLAGS (IF=1, interrupts enabled)
-    stack--;  *stack = 0x08;           // CS (code segment)
-    stack--;  *stack = (uint64_t)entry;  // RIP (entry point)
-    
-    // Build register save frame (what irq_common_stub pushes)
-    stack--;  *stack = 0;  // Interrupt number (dummy)
-    stack--;  *stack = 0;  // Error code (dummy)
-    stack--;  *stack = 0;  // RAX
-    stack--;  *stack = 0;  // RBX
-    stack--;  *stack = 0;  // RCX
-    stack--;  *stack = 0;  // RDX
-    stack--;  *stack = 0;  // RSI
-    stack--;  *stack = 0;  // RDI
-    stack--;  *stack = 0;  // RBP
-    stack--;  *stack = 0;  // R8
-    stack--;  *stack = 0;  // R9
-    stack--;  *stack = 0;  // R10
-    stack--;  *stack = 0;  // R11
-    stack--;  *stack = 0;  // R12
-    stack--;  *stack = 0;  // R13
-    stack--;  *stack = 0;  // R14
-    stack--;  *stack = 0;  // R15
-    
-    // Store stack pointer (points to R15 position)
-    proc->registers.rsp = (uint64_t)stack;
-    proc->registers.rbp = (uint64_t)proc->kernel_stack_top;
-    proc->registers.rip = (uint64_t)entry;
-    proc->registers.rflags = 0x202;  // Enable interrupts (IF flag)
-    
-    // Page table (for now, use kernel's - no isolation yet)
-    proc->page_table = NULL;  // NULL means use kernel page table
-    
-    // Add to ready queue
-    queue_enqueue(proc);
-    scheduler.process_count++;
-    
-    vga_print("[SCHED] Created process: ", VGA_COLOR_LIGHT_CYAN);
-    vga_print(proc->name, VGA_COLOR_LIGHT_CYAN);
-    vga_print(" (PID: ", VGA_COLOR_LIGHT_CYAN);
-    vga_print_int(proc->pid, VGA_COLOR_LIGHT_CYAN);
-    vga_print(")", VGA_COLOR_LIGHT_CYAN);
-    vga_print("\n", VGA_COLOR_WHITE);
-    
+
+    queue_push_back(proc);
+    sched.process_count++;
+
+    irq_restore(flags);
+
+    kprintf_color(VGA_COLOR_LIGHT_CYAN,
+                  "[SCHED] spawned %-12s pid=%u prio=%u\n",
+                  proc->name, proc->pid, priority);
+
     return proc;
 }
 
-/**
- * Kill a process and free resources
- */
-void process_kill(process_t* proc)
+// ---------------------------------------------------------------------------
+// The context switch
+// ---------------------------------------------------------------------------
+
+void schedule(void)
 {
-    if (!proc) return;
-    
-    proc->state = PROCESS_TERMINATED;
-    
-    // Remove from ready queue if there
-    if (proc->prev) proc->prev->next = proc->next;
-    if (proc->next) proc->next->prev = proc->prev;
-    if (scheduler.ready_queue_head == proc) scheduler.ready_queue_head = proc->next;
-    if (scheduler.ready_queue_tail == proc) scheduler.ready_queue_tail = proc->prev;
-    
-    // Free resources
-    if (proc->kernel_stack) kfree(proc->kernel_stack);
-    if (proc->user_stack) kfree(proc->user_stack);
-    kfree(proc);
-    
-    scheduler.process_count--;
+    // Callers must have interrupts disabled: we are about to mutate the ready
+    // queue and swap stacks, and an IRQ in the middle of that is unrecoverable.
+    process_t* prev = sched.current;
+
+    if (prev && prev->state == PROCESS_RUNNING) {
+        // Still runnable, so put it back. Aging resets: it just had the CPU.
+        prev->state       = PROCESS_READY;
+        prev->priority    = prev->base_priority;
+        prev->ready_since = sched.total_ticks;
+
+        // The idle process is never queued; it is the fallback, not a peer.
+        if (prev != &idle_process && !queue_contains(prev)) {
+            queue_push_back(prev);
+        }
+    }
+
+    process_t* next = pick_highest_ready();
+    if (next) {
+        queue_remove(next);
+    } else {
+        next = &idle_process;
+    }
+
+    next->state                = PROCESS_RUNNING;
+    next->priority             = next->base_priority;
+    next->time_slice_remaining = process_quantum_for(next);
+    need_reschedule            = 0;
+
+    if (next == prev) {
+        return;  // nothing better to run; keep going
+    }
+
+    sched.current = next;
+    sched.context_switches++;
+
+    // If prev exited, pass NULL so we do not write into a TCB that idle is
+    // about to free.
+    process_t* save_into = (prev && prev->state != PROCESS_TERMINATED) ? prev : NULL;
+
+    context_switch_asm(save_into, next);
 }
 
-/**
- * Get the currently running process
- */
-process_t* get_current_process(void)
+// Disable interrupts, switch, restore. For voluntary switches from normal
+// kernel code (yield, sleep, blocking reads).
+static void schedule_locked(void)
 {
-    return scheduler.current_process;
+    uint64_t flags = irq_save();
+    schedule();
+    irq_restore(flags);
 }
 
-/**
- * Pick the next process to run (round-robin)
- */
-process_t* scheduler_pick_next(void)
+void process_yield(void)
 {
-    // If current process is still running and has time left
-    if (scheduler.current_process != NULL &&
-        scheduler.current_process->state == PROCESS_RUNNING &&
-        scheduler.current_process->time_slice_remaining > 0) {
-        return scheduler.current_process;  // Keep current process
-    }
-    
-    // Current process needs to wait or is done
-    if (scheduler.current_process != NULL) {
-        scheduler.current_process->state = PROCESS_READY;
-        queue_enqueue(scheduler.current_process);
-    }
-    
-    // Get next ready process
-    process_t* next = queue_dequeue();
-    
-    if (next == NULL) {
-        // No processes ready - this shouldn't happen
-        vga_print("[ERR] No processes ready!", VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
-        return NULL;
-    }
-    
-    next->state = PROCESS_RUNNING;
-    next->time_slice_remaining = TIME_SLICE_TICKS;
-    
-    return next;
+    schedule_locked();
 }
 
-/**
- * Called every timer tick (10ms with PIT @ 100Hz)
- */
+// ---------------------------------------------------------------------------
+// Sleeping and blocking
+// ---------------------------------------------------------------------------
+
+void process_sleep(uint64_t ticks)
+{
+    if (ticks == 0) {
+        process_yield();
+        return;
+    }
+
+    uint64_t flags = irq_save();
+
+    process_t* current = sched.current;
+    if (!current || current == &idle_process) {
+        // Nothing to deschedule (very early boot, or the idle loop itself):
+        // fall back to a busy wait against the tick counter.
+        uint64_t deadline = sched.total_ticks + ticks;
+        irq_restore(flags);
+        while (sched.total_ticks < deadline) {
+            __asm__ volatile("hlt");
+        }
+        return;
+    }
+
+    current->state     = PROCESS_SLEEPING;
+    current->wake_time = sched.total_ticks + ticks;
+
+    schedule();
+    irq_restore(flags);
+}
+
+void process_sleep_ms(uint64_t milliseconds)
+{
+    // 100 Hz timer => one tick per 10 ms. Round up so sleep(1) is not sleep(0).
+    process_sleep((milliseconds + 9) / 10);
+}
+
+void process_block(uint64_t channel)
+{
+    uint64_t flags = irq_save();
+
+    process_t* current = sched.current;
+    if (!current || current == &idle_process) {
+        // Cannot block the idle process; just wait for an interrupt.
+        irq_restore(flags);
+        __asm__ volatile("hlt");
+        return;
+    }
+
+    current->state        = PROCESS_WAITING;
+    current->wait_channel = channel;
+
+    schedule();
+    irq_restore(flags);
+}
+
+uint32_t process_wake_all(uint64_t channel)
+{
+    uint32_t woken = 0;
+
+    // Called from interrupt handlers, so do not touch the current process or
+    // switch here - only move TCBs back onto the ready queue.
+    for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = all_processes[i];
+        if (!p || p->state != PROCESS_WAITING || p->wait_channel != channel) {
+            continue;
+        }
+
+        p->state        = PROCESS_READY;
+        p->wait_channel = WAIT_CHANNEL_NONE;
+        p->ready_since  = sched.total_ticks;
+
+        if (p != &idle_process && !queue_contains(p)) {
+            queue_push_back(p);
+        }
+        woken++;
+    }
+
+    return woken;
+}
+
+// ---------------------------------------------------------------------------
+// Termination
+// ---------------------------------------------------------------------------
+
+void process_exit(int32_t code)
+{
+    disable_interrupts();
+
+    process_t* current = sched.current;
+
+    if (!current || current == &idle_process) {
+        panic("process_exit: the idle process tried to exit (code %d)", code);
+    }
+
+    current->exit_code = code;
+    current->state     = PROCESS_TERMINATED;
+
+    // Make sure it is not sitting in the ready queue as a zombie.
+    if (queue_contains(current)) {
+        queue_remove(current);
+    }
+
+    kprintf_color(code == 0 ? VGA_COLOR_DARK_GREY : VGA_COLOR_LIGHT_RED,
+                  "[SCHED] %s (pid %u) exited with code %d\n",
+                  current->name, current->pid, code);
+
+    schedule();
+
+    // schedule() never picks a TERMINATED process, so we cannot get here.
+    panic("process_exit: scheduler resumed a terminated process (pid %u)",
+          current->pid);
+}
+
+int process_kill_pid(uint32_t pid)
+{
+    if (pid == 0) {
+        return 0;  // the idle process is not killable
+    }
+
+    uint64_t flags = irq_save();
+
+    process_t* target = NULL;
+    for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
+        if (all_processes[i] && all_processes[i]->pid == pid) {
+            target = all_processes[i];
+            break;
+        }
+    }
+
+    if (!target || target->state == PROCESS_TERMINATED) {
+        irq_restore(flags);
+        return 0;
+    }
+
+    // Killing yourself is just exiting.
+    if (target == sched.current) {
+        irq_restore(flags);
+        process_exit(-1);
+    }
+
+    if (queue_contains(target)) {
+        queue_remove(target);
+    }
+    target->state     = PROCESS_TERMINATED;
+    target->exit_code = -1;
+
+    irq_restore(flags);
+    return 1;
+}
+
+uint32_t scheduler_reap(void)
+{
+    uint32_t reaped = 0;
+    uint64_t flags  = irq_save();
+
+    for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = all_processes[i];
+
+        if (!p || p->state != PROCESS_TERMINATED || p == &idle_process) {
+            continue;
+        }
+
+        // Never free the stack we are standing on. Reaping only runs from
+        // idle, so this should be impossible - but the check is cheap and the
+        // failure mode (use-after-free of the live stack) is catastrophic.
+        if (p == sched.current) {
+            continue;
+        }
+
+        all_processes[i] = NULL;
+        sched.process_count--;
+
+        if (p->kernel_stack) kfree(p->kernel_stack);
+        if (p->user_stack)   kfree(p->user_stack);
+        kfree(p);
+
+        reaped++;
+    }
+
+    irq_restore(flags);
+    return reaped;
+}
+
+// ---------------------------------------------------------------------------
+// The timer tick
+// ---------------------------------------------------------------------------
+
 void scheduler_tick(void)
 {
-    scheduler.total_ticks++;
-    
-    if (scheduler.current_process) {
-        scheduler.current_process->total_ticks++;
-        scheduler.current_process->time_slice_remaining--;
-        
-        // Time quantum expired?
-        if (scheduler.current_process->time_slice_remaining == 0) {
+    sched.total_ticks++;
+
+    // --- Wake anything whose sleep has expired ---
+    for (uint32_t i = 0; i < MAX_PROCESSES; i++) {
+        process_t* p = all_processes[i];
+        if (!p || p->state != PROCESS_SLEEPING) {
+            continue;
+        }
+        if (sched.total_ticks >= p->wake_time) {
+            p->state       = PROCESS_READY;
+            p->wake_time   = 0;
+            p->ready_since = sched.total_ticks;
+            if (p != &idle_process && !queue_contains(p)) {
+                queue_push_back(p);
+            }
+            need_reschedule = 1;   // a waking process may outrank the current one
+        }
+    }
+
+    // --- Priority aging ---
+    // Anything that has been READY without running for a while gets a boost,
+    // so a busy high-priority process cannot starve the rest of the system.
+    if (sched.total_ticks - sched.last_aging_tick >= PRIORITY_AGING_INTERVAL) {
+        sched.last_aging_tick = sched.total_ticks;
+
+        for (process_t* p = sched.ready_head; p; p = p->next) {
+            if (sched.total_ticks - p->ready_since < PRIORITY_AGING_INTERVAL) {
+                continue;
+            }
+            if (p->priority < 250) {
+                p->priority += PRIORITY_AGING_STEP;
+            }
+        }
+    }
+
+    // --- Charge the running process and expire its quantum ---
+    //
+    // If nothing is scheduled yet we are still in early boot: count the tick
+    // and leave. Raising need_reschedule here would make irq_handler() call
+    // schedule() before the idle process has a valid stack.
+    process_t* current = sched.current;
+    if (current) {
+        current->total_ticks++;
+
+        if (current->time_slice_remaining > 0) {
+            current->time_slice_remaining--;
+        }
+
+        if (current->time_slice_remaining == 0) {
+            need_reschedule = 1;
+        }
+
+        // If something in the ready queue now outranks us, switch early
+        // instead of making a high-priority process wait out our quantum.
+        process_t* best = pick_highest_ready();
+        if (best && best->priority > current->priority) {
             need_reschedule = 1;
         }
     }
 }
 
-/**
- * Preemptive context switch handler (called from timer interrupt)
- * Stack pointer points to saved registers on interrupt stack
- */
-uint64_t preempt_handler(uint64_t stack_ptr)
-{
-    // Send EOI to PIC first
-    outb(0x20, 0x20);  // Send EOI to master PIC
-    
-    // Update scheduler tick count
-    scheduler.total_ticks++;
+// ---------------------------------------------------------------------------
+// Startup and introspection
+// ---------------------------------------------------------------------------
 
-    // Every ~2 seconds (@100Hz), print a compact summary line
-    #if DEBUG_SCHED_SUMMARY
-    if ((scheduler.total_ticks % 200) == 0 && scheduler.total_ticks > 0) {
-        // Print total ticks
-        vga_print("\n[SUM T=", VGA_COLOR_LIGHT_CYAN);
-        vga_print_int(scheduler.total_ticks, VGA_COLOR_LIGHT_CYAN);
-        vga_print("] ", VGA_COLOR_LIGHT_CYAN);
-        
-        // Print current process first, if any
-        if (scheduler.current_process) {
-            uint32_t pct = (scheduler.current_process->total_ticks * 100) / scheduler.total_ticks;
-            vga_print(scheduler.current_process->name, VGA_COLOR_BROWN);
-            vga_print(":", VGA_COLOR_BROWN);
-            vga_print_int(scheduler.current_process->total_ticks, VGA_COLOR_BROWN);
-            vga_print(" (", VGA_COLOR_DARK_GREY);
-            vga_print_int(pct, VGA_COLOR_DARK_GREY);
-            vga_print("%)", VGA_COLOR_DARK_GREY);
-            vga_print(" | ", VGA_COLOR_DARK_GREY);
-        }
-        
-        // Walk ready queue and print each process ticks
-        process_t* it = scheduler.ready_queue_head;
-        while (it) {
-            uint32_t ipct = (it->total_ticks * 100) / scheduler.total_ticks;
-            vga_print(it->name, VGA_COLOR_BROWN);
-            vga_print(":", VGA_COLOR_BROWN);
-            vga_print_int(it->total_ticks, VGA_COLOR_BROWN);
-            vga_print(" (", VGA_COLOR_DARK_GREY);
-            vga_print_int(ipct, VGA_COLOR_DARK_GREY);
-            vga_print("%)", VGA_COLOR_DARK_GREY);
-            if (it->next) {
-                vga_print(" | ", VGA_COLOR_DARK_GREY);
-            }
-            it = it->next;
-        }
-        vga_print("\n", VGA_COLOR_WHITE);
-    }
-    #endif
-    
-    // If no current process, just return same stack
-    if (!scheduler.current_process) {
-        return stack_ptr;
-    }
-    
-    // Update process statistics
-    scheduler.current_process->total_ticks++;
-    scheduler.current_process->time_slice_remaining--;
-    
-    // Check if time slice expired
-    if (scheduler.current_process->time_slice_remaining <= 0) {
-        // Save current process's stack pointer and state
-        process_t* prev = scheduler.current_process;
-        prev->registers.rsp = stack_ptr;
-        prev->state = PROCESS_READY;
-        
-        // Add back to queue
-        queue_enqueue(prev);
-        
-        // Pick next process
-        process_t* next = queue_dequeue();
-        
-        if (next) {
-            // Switch to next process
-            next->state = PROCESS_RUNNING;
-            next->time_slice_remaining = TIME_SLICE_TICKS;
-            scheduler.current_process = next;
-            
-            // Return next process's stack pointer
-            return next->registers.rsp;
-        }
-        
-        // No other process, reset time slice and continue
-        prev->time_slice_remaining = TIME_SLICE_TICKS;
-        prev->state = PROCESS_RUNNING;
-        scheduler.current_process = prev;
-    }
-    
-    // No switch needed - return same stack
-    return stack_ptr;
-}
-
-/**
- * Start the scheduler (called from kernel_main)
- */
 void scheduler_start(void)
 {
-    // Dequeue first process (removes from queue)
-    process_t* first = queue_dequeue();
-    
-    if (!first) {
-        vga_print("[ERR] No processes to run!", VGA_COLOR_LIGHT_RED);
-        vga_print("\n", VGA_COLOR_WHITE);
-        return;
+    disable_interrupts();
+
+    process_t* first = pick_highest_ready();
+    if (first) {
+        queue_remove(first);
+    } else {
+        first = &idle_process;
     }
-    
-    vga_print("[*] Starting first process: ", VGA_COLOR_LIGHT_GREEN);
-    vga_print(first->name, VGA_COLOR_LIGHT_GREEN);
-    vga_print("\n\n", VGA_COLOR_WHITE);
-    
-    first->state = PROCESS_RUNNING;
-    scheduler.current_process = first;
-    
-    // Switch to first process (no current process to save)
+
+    first->state                = PROCESS_RUNNING;
+    first->time_slice_remaining = process_quantum_for(first);
+    sched.current               = first;
+
+    kok("Handing control to \"%s\" (pid %u)\n\n", first->name, first->pid);
+
+    // NULL means "no context to save" - the boot stack is abandoned here and
+    // we never return to kernel_main().
     context_switch_asm(NULL, first);
-    
-    // Should never return here
-    vga_print("[ERR] Context switch returned!", VGA_COLOR_LIGHT_RED);
-    vga_print("\n", VGA_COLOR_WHITE);
+
+    panic("scheduler_start: context_switch_asm returned");
 }
 
-/**
- * Perform a context switch (cooperative - called by processes)
- */
-void do_schedule(void)
+process_t* get_current_process(void)
 {
-    process_t* current = scheduler.current_process;
-    
-    // Pick next process to run
-    process_t* next = scheduler_pick_next();
-    
-    if (!next) {
-        return;  // No process to switch to
-    }
-    
-    // Don't switch to ourselves
-    if (next == current) {
-        return;
-    }
-    
-    // Update scheduler state
-    scheduler.current_process = next;
-    
-    // Perform context switch: save current, load next
-    context_switch_asm(current, next);
+    return sched.current;
 }
 
-/**
- * Print scheduler statistics
- */
+uint64_t scheduler_get_ticks(void)
+{
+    return sched.total_ticks;
+}
+
+uint32_t scheduler_get_process_count(void)
+{
+    return sched.process_count;
+}
+
+process_t* scheduler_pick_next(void)
+{
+    return pick_highest_ready();
+}
+
 void scheduler_print_stats(void)
 {
-    vga_print("\n[SCHED] Scheduler Statistics:\n", VGA_COLOR_LIGHT_GREEN);
-    vga_print("  Total Ticks: ", VGA_COLOR_LIGHT_GREEN);
-    vga_print_int(scheduler.total_ticks, VGA_COLOR_LIGHT_GREEN);
-    vga_print("\n  Processes: ", VGA_COLOR_LIGHT_GREEN);
-    vga_print_int(scheduler.process_count, VGA_COLOR_LIGHT_GREEN);
-    vga_print("\n  Current: ", VGA_COLOR_LIGHT_GREEN);
-    if (scheduler.current_process) {
-        vga_print(scheduler.current_process->name, VGA_COLOR_LIGHT_GREEN);
-        vga_print(" (PID ", VGA_COLOR_LIGHT_GREEN);
-        vga_print_int(scheduler.current_process->pid, VGA_COLOR_LIGHT_GREEN);
-        vga_print(", CPU ticks: ", VGA_COLOR_LIGHT_GREEN);
-        vga_print_int(scheduler.current_process->total_ticks, VGA_COLOR_LIGHT_GREEN);
-        vga_print(")", VGA_COLOR_LIGHT_GREEN);
+    kprintf_color(VGA_COLOR_LIGHT_GREEN, "\nScheduler statistics\n");
+    kprintf("  Uptime            : %lu ticks (%lu.%02lu s)\n",
+            sched.total_ticks, sched.total_ticks / 100, sched.total_ticks % 100);
+    kprintf("  Processes         : %u\n", sched.process_count);
+    kprintf("  Context switches  : %lu\n", sched.context_switches);
+
+    if (sched.current) {
+        kprintf("  Running           : %s (pid %u, %lu ticks of CPU)\n",
+                sched.current->name, sched.current->pid,
+                sched.current->total_ticks);
     } else {
-        vga_print("None", VGA_COLOR_LIGHT_GREEN);
+        kprintf("  Running           : none\n");
     }
-    vga_print("\n", VGA_COLOR_WHITE);
 }
