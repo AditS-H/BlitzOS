@@ -38,7 +38,9 @@ void multiboot2_parse(uint32_t magic, uint64_t addr) {
     
     vga_print("[*] Parsing multiboot2 info...\n", VGA_COLOR_BROWN);
     
-    multiboot_info_t* mbi = (multiboot_info_t*)addr;
+    // The multiboot2 information structure starts with an 8-byte header
+    // (total_size, reserved) followed by the tag list, so the walk below
+    // starts at addr + 8. The header itself carries nothing we need.
     multiboot_tag_t* tag;
     
     // Iterate through all tags
@@ -79,9 +81,9 @@ void multiboot2_parse(uint32_t magic, uint64_t addr) {
                 vga_print("    Memory map found\n", VGA_COLOR_WHITE);
                 
                 // Display memory regions
-                multiboot_mmap_entry_t* entry = mmap_tag->entries;
+                const multiboot_mmap_entry_t* entry = mmap_tag->entries;
                 for (; (uint8_t*)entry < (uint8_t*)tag + tag->size;
-                     entry = (multiboot_mmap_entry_t*)((uint64_t)entry + mmap_tag->entry_size)) {
+                     entry = (const multiboot_mmap_entry_t*)((uint64_t)entry + mmap_tag->entry_size)) {
                     
                     char buf[32];
                     vga_print("      0x", VGA_COLOR_WHITE);

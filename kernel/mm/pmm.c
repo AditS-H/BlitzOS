@@ -10,8 +10,13 @@ static uint64_t total_pages = 0;
 static uint64_t used_pages = 0;
 static uint64_t memory_size = 0;
 
-// Kernel end address (defined in linker script)
-extern uint8_t kernel_end;
+// Kernel end address (defined in the linker script).
+//
+// Declared as an unbounded array, not a scalar. With `extern uint8_t
+// kernel_end;` GCC treats it as exactly one byte, so every bitmap[] access
+// derived from its address looked like an out-of-bounds write and produced a
+// -Warray-bounds warning on each build.
+extern uint8_t kernel_end[];
 
 // Helper functions
 static inline void bitmap_set(uint64_t bit) {
@@ -82,7 +87,7 @@ void pmm_init(void) {
     uint64_t bitmap_size = (total_pages + 7) / 8;
     
     // Place bitmap after kernel
-    bitmap = (uint8_t*)((uint64_t)&kernel_end);
+    bitmap = kernel_end;
     
     // Initialize bitmap - mark all as used initially
     for (uint64_t i = 0; i < bitmap_size; i++) {
@@ -111,16 +116,31 @@ void pmm_init(void) {
     
     // Reserve kernel and bitmap
     uint64_t kernel_start = 0x100000; // 1 MB (where kernel is loaded)
-    uint64_t kernel_pages = ((uint64_t)&kernel_end - kernel_start + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t kernel_pages = ((uint64_t)kernel_end - kernel_start + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t bitmap_pages = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    
+
     for (uint64_t i = kernel_start / PAGE_SIZE; i < (kernel_start / PAGE_SIZE + kernel_pages + bitmap_pages); i++) {
         if (i < total_pages && !bitmap_test(i)) {
             bitmap_set(i);
             used_pages++;
         }
     }
-    
+
+    // Reserve everything below 1 MB.
+    //
+    // Two reasons. First, the low megabyte holds the BIOS data area, the real
+    // mode IVT, VGA memory and other things we must not hand out. Second, and
+    // more subtly: the firmware memory map marks 0x0-0x9FC00 as available, so
+    // the very first pmm_alloc_page() used to return physical address 0 - a
+    // pointer indistinguishable from NULL. Every caller then treated a
+    // successful allocation as an out-of-memory failure.
+    for (uint64_t i = 0; i < (0x100000 / PAGE_SIZE) && i < total_pages; i++) {
+        if (!bitmap_test(i)) {
+            bitmap_set(i);
+            used_pages++;
+        }
+    }
+
     char buf[32];
     vga_print("    Total memory: ", VGA_COLOR_WHITE);
     uint64_to_str_dec(memory_size / 1024 / 1024, buf);
@@ -140,35 +160,109 @@ void pmm_init(void) {
     vga_print("[OK] PMM initialized!\n", VGA_COLOR_LIGHT_GREEN);
 }
 
+// Where the last successful allocation finished. Scanning from here instead of
+// from page 0 every time turns allocation from O(total_pages) into roughly
+// O(1) once the low pages are exhausted.
+static uint64_t search_hint = 0;
+
 // Allocate a physical page
 void* pmm_alloc_page(void) {
-    // Find first free page
-    for (uint64_t i = 0; i < total_pages; i++) {
-        if (!bitmap_test(i)) {
-            bitmap_set(i);
-            used_pages++;
-            return (void*)(i * PAGE_SIZE);
+    // Two passes: from the hint to the end, then from the start to the hint.
+    for (uint64_t pass = 0; pass < 2; pass++) {
+        uint64_t start = (pass == 0) ? search_hint : 0;
+        uint64_t end   = (pass == 0) ? total_pages : search_hint;
+
+        for (uint64_t i = start; i < end; i++) {
+            if (!bitmap_test(i)) {
+                bitmap_set(i);
+                used_pages++;
+                search_hint = i + 1;
+                return (void*)(i * PAGE_SIZE);
+            }
         }
     }
-    
+
     // Out of memory
     return 0;
+}
+
+// Allocate `count` *physically contiguous* pages.
+//
+// The heap needs this. Its expand_heap() used to call pmm_alloc_page() in a
+// loop and assume the results were adjacent, then treat the whole run as one
+// block. That happened to hold on a freshly booted machine and quietly
+// corrupted the heap once allocation and freeing had fragmented the bitmap.
+void* pmm_alloc_pages(uint64_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    if (count == 1) {
+        return pmm_alloc_page();
+    }
+
+    uint64_t run_start = 0;
+    uint64_t run_length = 0;
+
+    for (uint64_t i = 0; i < total_pages; i++) {
+        if (bitmap_test(i)) {
+            run_length = 0;
+            continue;
+        }
+
+        if (run_length == 0) {
+            run_start = i;
+        }
+        run_length++;
+
+        if (run_length == count) {
+            for (uint64_t j = 0; j < count; j++) {
+                bitmap_set(run_start + j);
+            }
+            used_pages += count;
+            search_hint = run_start + count;
+            return (void*)(run_start * PAGE_SIZE);
+        }
+    }
+
+    return 0;  // no contiguous run large enough
+}
+
+// Free a run allocated with pmm_alloc_pages().
+void pmm_free_pages(void* pages, uint64_t count) {
+    uint64_t pfn = (uint64_t)pages / PAGE_SIZE;
+
+    for (uint64_t i = 0; i < count; i++) {
+        if (pfn + i >= total_pages || !bitmap_test(pfn + i)) {
+            continue;
+        }
+        bitmap_clear(pfn + i);
+        used_pages--;
+    }
+
+    if (pfn < search_hint) {
+        search_hint = pfn;
+    }
 }
 
 // Free a physical page
 void pmm_free_page(void* page) {
     uint64_t pfn = (uint64_t)page / PAGE_SIZE;
-    
+
     if (pfn >= total_pages) {
         return; // Invalid page
     }
-    
+
     if (!bitmap_test(pfn)) {
         return; // Already free
     }
-    
+
     bitmap_clear(pfn);
     used_pages--;
+
+    // Reuse the hole on the next allocation instead of stranding it.
+    if (pfn < search_hint) {
+        search_hint = pfn;
+    }
 }
 
 // Get total memory

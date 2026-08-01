@@ -19,6 +19,14 @@ void* pmm_alloc_page(void);
 // Free a physical page frame
 void pmm_free_page(void* page);
 
+// Allocate `count` physically contiguous page frames. Returns NULL if no run
+// that long is free. Required by anything that treats several pages as one
+// object - the kernel heap, DMA buffers, page tables.
+void* pmm_alloc_pages(uint64_t count);
+
+// Free a run previously returned by pmm_alloc_pages().
+void pmm_free_pages(void* pages, uint64_t count);
+
 // Get total memory in bytes
 uint64_t pmm_get_total_memory(void);
 
