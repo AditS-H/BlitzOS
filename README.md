@@ -12,7 +12,7 @@ Verified in QEMU: 156 context switches over 20 s of uptime with three
 concurrent workers at different priorities, all sleeping, exiting and being
 reaped with the heap returning to its exact pre-spawn size.
 
-## 📚 Documentation Structure
+## � Documentation Structure
 
 ### Essential Reading (Start Here)
 - **[whole documentation/INDEX.md](whole documentation/INDEX.md)** - Complete documentation index and navigation

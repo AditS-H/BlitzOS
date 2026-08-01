@@ -1,6 +1,5 @@
 #include "pit.h"
 #include "../kernel/arch/x86_64/interrupts.h"
-#include "../kernel/proc/process.h"
 
 // Monotonic tick counter. 64-bit, so it will not wrap in any realistic uptime
 // (at 100 Hz that is about 5.8 billion years).
