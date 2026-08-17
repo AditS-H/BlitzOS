@@ -94,4 +94,24 @@ const multiboot_tag_basic_meminfo_t* multiboot2_get_basic_meminfo(void);
 // Get bootloader name
 const char* multiboot2_get_bootloader_name(void);
 
+// ---------------------------------------------------------------------------
+// Boot modules
+//
+// GRUB can load extra files alongside the kernel ("module2" lines in grub.cfg)
+// and leaves each one in memory with a tag describing where it landed and what
+// its command line was. That is how compiled user programs reach the kernel
+// before there is any disk driver: the bootloader is the filesystem.
+// ---------------------------------------------------------------------------
+
+#define MULTIBOOT_MAX_MODULES 8
+
+typedef struct {
+    uint32_t    start;    // physical address of the first byte
+    uint32_t    end;      // one past the last byte
+    const char* cmdline;  // the string after the path in grub.cfg
+} multiboot_module_t;
+
+uint32_t                  multiboot2_module_count(void);
+const multiboot_module_t* multiboot2_module_at(uint32_t index);
+
 #endif // MULTIBOOT2_H

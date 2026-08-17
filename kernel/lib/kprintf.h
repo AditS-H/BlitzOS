@@ -36,6 +36,18 @@ void kprintf_color(vga_color_t color, const char* fmt, ...)
 // va_list forms, for wrapping kprintf in your own helpers.
 void kvprintf(vga_color_t color, const char* fmt, va_list args);
 
+// Redirect console output somewhere other than VGA text mode.
+//
+// Needed once the desktop takes over the screen: VGA text memory is no longer
+// being scanned out, so kprintf() would be writing into the void. The GUI
+// terminal window installs a hook here and every kernel message lands in the
+// window instead. Serial always gets a copy either way, so the boot log is
+// never lost no matter which mode is active.
+//
+// Pass NULL to go back to writing directly to VGA text mode.
+typedef void (*kprintf_sink_fn)(char c, vga_color_t color);
+void kprintf_set_console_hook(kprintf_sink_fn hook);
+
 // Format into a caller-supplied buffer. Always NUL-terminates. Returns the
 // number of characters written, not counting the terminator.
 int ksnprintf(char* buf, size_t size, const char* fmt, ...)

@@ -32,14 +32,23 @@ stack_bottom:
     resb 16384  ; 16 KB boot stack (abandoned once the scheduler starts)
 stack_top:
 
-; Initial page tables
+; Initial page tables.
+;
+; pd0..pd3 MUST stay adjacent: the mapping loop below walks all four as one
+; flat array of 2048 entries.
 align 4096
 pml4:
     resb 4096
 pdpt:
     resb 4096
-pd:
-    resb 4096
+pd0:
+    resb 4096   ; 0-1 GB
+pd1:
+    resb 4096   ; 1-2 GB
+pd2:
+    resb 4096   ; 2-3 GB
+pd3:
+    resb 4096   ; 3-4 GB  (the PCI MMIO hole lives here)
 pt0:
     resb 4096   ; 4 KB granularity for the first 2 MB (see below)
 
@@ -63,7 +72,7 @@ _start:
 
     ; ---- Clear the page tables ----
     mov edi, pml4
-    mov ecx, 4 * 4096 / 4
+    mov ecx, 7 * 4096 / 4   ; pml4, pdpt, pd0-pd3, pt0
     xor eax, eax
     rep stosd
 
@@ -72,22 +81,39 @@ _start:
     or eax, 0x03            ; present | writable
     mov [pml4], eax
 
-    ; PDPT[0] -> PD
-    mov eax, pd
+    ; PDPT[0..3] -> pd0..pd3, covering 0-4 GB
+    mov eax, pd0
     or eax, 0x03
-    mov [pdpt], eax
+    mov [pdpt + 0], eax
+    mov eax, pd1
+    or eax, 0x03
+    mov [pdpt + 8], eax
+    mov eax, pd2
+    or eax, 0x03
+    mov [pdpt + 16], eax
+    mov eax, pd3
+    or eax, 0x03
+    mov [pdpt + 24], eax
 
-    ; ---- Identity map the first 1 GB with 512 x 2 MB pages ----
+    ; ---- Identity map the first 4 GB with 2048 x 2 MB pages ----
     ;
-    ; This used to map a single 2 MB page. Everything the kernel touches has to
-    ; live inside the identity map, and the heap hands out raw physical pages
-    ; as if they were virtual addresses - so the moment allocations passed the
-    ; 2 MB mark, the kernel page-faulted on its own memory. Mapping a full
-    ; gigabyte costs nothing extra: the PD is already a 4 KB page, and filling
-    ; all 512 entries uses the space that was sitting empty.
-    mov edi, pd
+    ; Originally this mapped a single 2 MB page. Two separate problems forced it
+    ; wider:
+    ;
+    ;   1 GB: the heap hands out raw physical pages and uses them as virtual
+    ;   addresses, so the first allocation past the mapped region page-faulted
+    ;   on the kernel's own memory.
+    ;
+    ;   4 GB: PCI devices expose their memory through BARs up in the MMIO hole
+    ;   just below 4 GB - QEMU puts the graphics adapter's framebuffer around
+    ;   0xFD000000. Without a mapping there, touching the framebuffer faults, so
+    ;   there is no way to draw anything.
+    ;
+    ; pd0..pd3 are contiguous in .bss, so one loop fills all four.
+    ; Cost: 16 KB of page tables for the entire low 4 GB.
+    mov edi, pd0
     mov eax, 0x83           ; present | writable | huge (2 MB)
-    mov ecx, 512
+    mov ecx, 2048           ; 4 tables x 512 entries
 .map_2mb_pages:
     mov [edi], eax
     mov dword [edi + 4], 0  ; high half of the entry
@@ -117,11 +143,11 @@ _start:
     add edi, 8
     loop .map_low_4k
 
-    ; Point PD[0] at that table instead of the 2 MB huge page.
+    ; Point PD0[0] at that table instead of the 2 MB huge page.
     mov eax, pt0
     or eax, 0x03
-    mov [pd], eax
-    mov dword [pd + 4], 0
+    mov [pd0], eax
+    mov dword [pd0 + 4], 0
 
     ; ---- Enter long mode ----
     mov eax, pml4

@@ -17,6 +17,15 @@ typedef struct {
     vga_color_t color;
 } sink_t;
 
+// Where console output goes when it is not VGA text mode. NULL means "straight
+// to the VGA text buffer", which is the state during boot and in text mode.
+static kprintf_sink_fn console_hook = NULL;
+
+void kprintf_set_console_hook(kprintf_sink_fn hook)
+{
+    console_hook = hook;
+}
+
 static void sink_putchar(sink_t* sink, char c)
 {
     if (sink->buf) {
@@ -24,7 +33,13 @@ static void sink_putchar(sink_t* sink, char c)
             sink->buf[sink->written] = c;
         }
     } else {
-        vga_putchar(c, sink->color);
+        if (console_hook) {
+            console_hook(c, sink->color);
+        } else {
+            vga_putchar(c, sink->color);
+        }
+        // Serial gets a copy regardless of which console is active, so the
+        // boot log survives switching into graphics mode.
         serial_putchar(c);
     }
     sink->written++;

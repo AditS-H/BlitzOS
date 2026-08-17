@@ -5,13 +5,24 @@
 // (at 100 Hz that is about 5.8 billion years).
 static volatile uint64_t timer_ticks = 0;
 
+// Current tick rate. Starts at TIMER_FREQUENCY and can be raised by game mode.
+static uint32_t current_frequency = TIMER_FREQUENCY;
+
 // ---------------------------------------------------------------------------
 // Timer
 // ---------------------------------------------------------------------------
 
 void pit_init(void)
 {
-    uint32_t divisor = PIT_FREQUENCY / TIMER_FREQUENCY;
+    pit_set_frequency(TIMER_FREQUENCY);
+}
+
+void pit_set_frequency(uint32_t hz)
+{
+    if (hz < 19)    hz = 19;      // below this the 16-bit divisor overflows
+    if (hz > 10000) hz = 10000;   // above this the interrupt cost dominates
+
+    uint32_t divisor = PIT_FREQUENCY / hz;
 
     // Command byte 0x36:
     //   bits 7-6 = 00  channel 0
@@ -22,6 +33,13 @@ void pit_init(void)
 
     outb(PIT_CHANNEL0, (uint8_t)(divisor & 0xFF));
     outb(PIT_CHANNEL0, (uint8_t)((divisor >> 8) & 0xFF));
+
+    current_frequency = hz;
+}
+
+uint32_t pit_get_frequency(void)
+{
+    return current_frequency;
 }
 
 void pit_handler(void)

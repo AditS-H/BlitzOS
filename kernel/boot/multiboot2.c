@@ -29,6 +29,17 @@ static void uint64_to_str(uint64_t num, char* buf) {
 }
 
 // Parse multiboot2 info structure
+static multiboot_module_t modules[MULTIBOOT_MAX_MODULES];
+static uint32_t           module_count = 0;
+
+uint32_t multiboot2_module_count(void) {
+    return module_count;
+}
+
+const multiboot_module_t* multiboot2_module_at(uint32_t index) {
+    return index < module_count ? &modules[index] : 0;
+}
+
 void multiboot2_parse(uint32_t magic, uint64_t addr) {
     // Verify magic number
     if (magic != MULTIBOOT2_BOOTLOADER_MAGIC) {
@@ -52,7 +63,33 @@ void multiboot2_parse(uint32_t magic, uint64_t addr) {
             case MULTIBOOT_TAG_TYPE_CMDLINE:
                 // Command line
                 break;
-                
+
+            case MULTIBOOT_TAG_TYPE_MODULE: {
+                // A file GRUB loaded alongside the kernel, from a `module2`
+                // line in grub.cfg. This is how compiled user programs reach
+                // the OS before there is any disk driver.
+                //
+                // Tag layout: type (4), size (4), mod_start (4), mod_end (4),
+                // then a NUL-terminated command line filling the rest.
+                if (module_count < MULTIBOOT_MAX_MODULES) {
+                    const uint32_t* fields =
+                        (const uint32_t*)((const uint8_t*)tag + 8);
+
+                    modules[module_count].start   = fields[0];
+                    modules[module_count].end     = fields[1];
+                    modules[module_count].cmdline =
+                        (const char*)((const uint8_t*)tag + 16);
+                    module_count++;
+
+                    vga_print("    Boot module: ", VGA_COLOR_WHITE);
+                    vga_print((const char*)((const uint8_t*)tag + 16),
+                              VGA_COLOR_LIGHT_CYAN);
+                    vga_print("\n", VGA_COLOR_WHITE);
+                }
+                break;
+            }
+
+
             case MULTIBOOT_TAG_TYPE_BOOT_LOADER_NAME:
                 bootloader_tag = (multiboot_tag_string_t*)tag;
                 vga_print("    Bootloader: ", VGA_COLOR_WHITE);

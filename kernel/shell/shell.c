@@ -12,6 +12,15 @@
 #include "../../drivers/keyboard.h"
 #include "../../drivers/pit.h"
 #include "../../drivers/serial.h"
+#include "../../drivers/mouse.h"
+#include "../../drivers/pci/pci.h"
+#include "../../drivers/video/framebuffer.h"
+#include "../../drivers/video/bga.h"
+#include "../arch/x86_64/sse.h"
+#include "../arch/x86_64/tsc.h"
+#include "../gui/gui.h"
+#include "../gui/apps.h"
+#include "../exec/elf.h"
 
 // ---------------------------------------------------------------------------
 // Shell state
@@ -22,6 +31,20 @@ static char    history[SHELL_HISTORY_SIZE][SHELL_LINE_MAX];
 static int     history_count = 0;
 static int     history_pos   = 0;     // browse cursor, == history_count when at the live line
 static int32_t cwd = VFS_ROOT_NODE;
+
+// Where read_line() gets its keys. Defaults to the raw keyboard; the GUI
+// terminal swaps in its own queue via shell_set_input_source().
+static int (*input_getkey)(void) = NULL;
+
+void shell_set_input_source(int (*getkey)(void))
+{
+    input_getkey = getkey;
+}
+
+static int shell_read_key(void)
+{
+    return input_getkey ? input_getkey() : keyboard_getkey();
+}
 
 typedef struct {
     const char* name;
@@ -109,11 +132,23 @@ static void cmd_ver(int argc, char** argv)
 {
     (void)argc; (void)argv;
 
-    kprintf_color(VGA_COLOR_LIGHT_CYAN,
-        "\n  BlitzOS v0.5 \"Preemption\"\n");
-    kprintf("  x86-64 long mode, monolithic kernel\n");
-    kprintf("  Preemptive priority scheduler, INT 0x80 syscalls, ramfs\n");
-    kprintf("  Serial console: %s\n\n",
+    const fb_stats_t* gfx = fb_get_stats();
+    const cpu_features_t* cpu = cpu_get_features();
+
+    kprintf_color(VGA_COLOR_LIGHT_CYAN, "\n  BlitzOS v0.6 \"Desktop\"\n");
+    kprintf("  x86-64 long mode, monolithic kernel\n\n");
+    kprintf("  Scheduler  : preemptive, priority-based with aging\n");
+    kprintf("  Syscalls   : INT 0x80, 26 entry points\n");
+    kprintf("  Filesystem : in-memory ramfs\n");
+    kprintf("  Graphics   : %s\n",
+            fb_is_active() ? "active" : "text mode (run `desktop`)");
+    kprintf("  Blitter    : %s\n",
+            cpu->has_sse2 && sse_is_enabled() ? "SSE2, state saved per switch"
+                                              : "scalar");
+    kprintf("  Page flip  : %s\n",
+            gfx->hardware_flip ? "hardware" : "software / inactive");
+    kprintf("  Programs   : ELF64 loader, ET_EXEC and ET_DYN\n");
+    kprintf("  Serial     : %s\n\n",
             serial_is_available() ? "COM1 @ 38400 8N1" : "not detected");
 }
 
@@ -707,6 +742,204 @@ static void cmd_halt(int argc, char** argv)
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Commands: graphics and hardware
+// ---------------------------------------------------------------------------
+
+static void cmd_desktop(int argc, char** argv)
+{
+    uint32_t width  = (argc > 1) ? (uint32_t)str_to_int(argv[1]) : 1024;
+    uint32_t height = (argc > 2) ? (uint32_t)str_to_int(argv[2]) : 768;
+
+    if (gui_is_running()) {
+        kprintf_color(VGA_COLOR_LIGHT_RED, "desktop: already running\n");
+        return;
+    }
+
+    kprintf("Starting desktop at %ux%u. ESC inside the desktop returns here.\n",
+            width, height);
+    process_sleep_ms(300);
+
+    if (!gui_start(width, height)) {
+        kprintf_color(VGA_COLOR_LIGHT_RED,
+                      "desktop: could not initialise graphics; still in text mode\n");
+        return;
+    }
+
+    // From here the compositor owns the screen and the keyboard. Read our keys
+    // from the terminal window instead, so both can coexist.
+    shell_set_input_source(terminal_getkey);
+}
+
+static void cmd_lspci(int argc, char** argv)
+{
+    (void)argc; (void)argv;
+
+    kprintf_color(VGA_COLOR_LIGHT_GREEN,
+                  "\n BUS:DEV.FN  VENDOR:DEVICE  CLASS\n");
+
+    for (uint32_t i = 0; i < pci_device_count(); i++) {
+        const pci_device_t* dev = pci_device_at(i);
+        if (!dev) continue;
+
+        kprintf("  %02x:%02x.%u    %04x:%04x      %s (%s)\n",
+                dev->bus, dev->device, dev->function,
+                dev->vendor_id, dev->device_id,
+                pci_class_name(dev->class_code, dev->subclass),
+                pci_vendor_name(dev->vendor_id));
+
+        for (int b = 0; b < 6; b++) {
+            if (dev->bar[b] == 0) continue;
+            kprintf_color(VGA_COLOR_DARK_GREY, "               BAR%d %s 0x%lx\n",
+                          b, dev->bar_is_io[b] ? "io " : "mem", dev->bar[b]);
+        }
+    }
+    kprintf("\n");
+}
+
+static void cmd_cpuinfo(int argc, char** argv)
+{
+    (void)argc; (void)argv;
+
+    const cpu_features_t* cpu = cpu_get_features();
+
+    kprintf_color(VGA_COLOR_LIGHT_GREEN, "\nCPU\n");
+    kprintf("  Vendor    : %s\n", cpu->vendor);
+    if (cpu->brand[0]) {
+        kprintf("  Model     : %s\n", cpu->brand);
+    }
+    kprintf("  Features  : %s%s%s%s%s%s%s\n",
+            cpu->has_sse   ? "sse "   : "",
+            cpu->has_sse2  ? "sse2 "  : "",
+            cpu->has_sse3  ? "sse3 "  : "",
+            cpu->has_ssse3 ? "ssse3 " : "",
+            cpu->has_sse41 ? "sse4.1 ": "",
+            cpu->has_sse42 ? "sse4.2 ": "",
+            cpu->has_avx   ? "avx"    : "");
+    kprintf("  FXSAVE    : %s\n", cpu->has_fxsr ? "yes" : "no");
+    kprintf("  SSE state : %s\n",
+            sse_is_enabled() ? "enabled, saved on every context switch"
+                             : "disabled");
+    kprintf("  TSC       : %lu MHz%s\n", tsc_cycles_per_us(),
+            cpu->has_invariant_tsc ? ", invariant" : "");
+    kprintf("  Timer     : %u Hz\n\n", pit_get_frequency());
+}
+
+static void cmd_gfxstat(int argc, char** argv)
+{
+    (void)argc; (void)argv;
+
+    const bga_info_t* gpu = bga_get_info();
+
+    kprintf_color(VGA_COLOR_LIGHT_GREEN, "\nDisplay adapter\n");
+    if (!gpu->present) {
+        kprintf("  No BGA-compatible adapter detected.\n\n");
+        return;
+    }
+
+    kprintf("  BGA version : 0x%x\n", gpu->version);
+    kprintf("  Framebuffer : 0x%lx\n", gpu->framebuffer_phys);
+    kprintf("  VRAM        : %lu MB\n", gpu->vram_bytes / (1024 * 1024));
+    kprintf("  Mode        : %ux%u at %u bpp\n", gpu->width, gpu->height, gpu->bpp);
+    kprintf("  Virtual     : %u rows (%s)\n", gpu->virtual_height,
+            gpu->virtual_height >= gpu->height * 2 ? "double buffered"
+                                                   : "single buffered");
+
+    if (!fb_is_active()) {
+        kprintf("\n  Framebuffer inactive - run `desktop` first.\n\n");
+        return;
+    }
+
+    const fb_stats_t* stats = fb_get_stats();
+
+    kprintf_color(VGA_COLOR_LIGHT_GREEN, "\nFrame pipeline\n");
+    kprintf("  Frames      : %lu\n", stats->frames_presented);
+    kprintf("  Present     : %u us average, %u min, %u max\n",
+            stats->average_frame_us, stats->min_frame_us, stats->max_frame_us);
+    kprintf("  Page flip   : %s\n",
+            stats->hardware_flip ? "hardware (one register write)"
+                                 : "software copy");
+    kprintf("  Blitter     : %s\n",
+            stats->sse_blitter ? "SSE2, 16 bytes per instruction"
+                               : "scalar, 8 bytes per instruction");
+
+    if (stats->total_pixels_possible) {
+        uint64_t saved = 100 - (stats->total_pixels_copied * 100 /
+                                stats->total_pixels_possible);
+        kprintf("  Dirty rects : %lu%% of full-screen blits avoided\n", saved);
+        kprintf("  Pixels      : %lu copied of %lu possible\n",
+                stats->total_pixels_copied, stats->total_pixels_possible);
+    }
+    kprintf("\n");
+}
+
+static void cmd_gamemode(int argc, char** argv)
+{
+    if (!gui_is_running()) {
+        kprintf_color(VGA_COLOR_LIGHT_RED,
+                      "gamemode: only meaningful with the desktop running\n");
+        return;
+    }
+
+    int enable = (argc > 1) ? (strcmp(argv[1], "off") != 0) : !gui_get_game_mode();
+    gui_set_game_mode(enable);
+}
+
+// ---------------------------------------------------------------------------
+// Commands: running compiled programs
+// ---------------------------------------------------------------------------
+
+static void cmd_run(int argc, char** argv)
+{
+    if (argc < 2) {
+        kprintf_color(VGA_COLOR_LIGHT_RED, "usage: run <path> [priority]\n");
+        kprintf_color(VGA_COLOR_DARK_GREY,
+                      "  Programs shipped in the ISO appear under /bin.\n");
+        return;
+    }
+
+    uint32_t priority = (argc > 2) ? (uint32_t)str_to_int(argv[2])
+                                   : DEFAULT_PRIORITY;
+
+    int32_t result = elf_exec(argv[1], priority);
+
+    if (result < 0) {
+        kprintf_color(VGA_COLOR_LIGHT_RED, "run: %s: %s\n", argv[1],
+                      elf_error_string(result));
+        return;
+    }
+
+    kprintf_color(VGA_COLOR_DARK_GREY,
+                  "Started %s as pid %d.\n", argv[1], result);
+}
+
+static void cmd_readelf(int argc, char** argv)
+{
+    if (argc < 2) {
+        kprintf_color(VGA_COLOR_LIGHT_RED, "usage: readelf <path>\n");
+        return;
+    }
+
+    int32_t node = vfs_resolve(argv[1], cwd);
+    if (node < 0) {
+        kprintf_color(VGA_COLOR_LIGHT_RED, "readelf: %s: %s\n", argv[1],
+                      vfs_error_string(node));
+        return;
+    }
+
+    vfs_node_t* file = vfs_get_node(node);
+    if (!file || file->type != VFS_NODE_FILE) {
+        kprintf_color(VGA_COLOR_LIGHT_RED, "readelf: %s is not a file\n", argv[1]);
+        return;
+    }
+
+    kprintf_color(VGA_COLOR_LIGHT_GREEN, "\n%s (%lu bytes)\n",
+                  argv[1], (uint64_t)file->size);
+    elf_describe(file->data, file->size);
+    kprintf("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Command table
 // ---------------------------------------------------------------------------
@@ -738,6 +971,13 @@ static const command_t commands[] = {
     { "beep",    "beep [hz] [ms]",              "PC speaker tone",                    cmd_beep },
     { "rainbow", "rainbow <text...>",           "print text in rainbow colours",      cmd_rainbow },
     { "party",   "party [ms]",                  "confetti, via a syscall",            cmd_party },
+    { "run",     "run <path> [priority]",       "load and run a compiled program",    cmd_run },
+    { "readelf", "readelf <path>",              "inspect an ELF file without running", cmd_readelf },
+    { "desktop", "desktop [w] [h]",             "start the graphical desktop",        cmd_desktop },
+    { "gamemode","gamemode [on|off]",           "low-latency mode for the desktop",   cmd_gamemode },
+    { "gfxstat", "gfxstat",                     "GPU and frame pipeline statistics",  cmd_gfxstat },
+    { "lspci",   "lspci",                       "list PCI devices and their BARs",    cmd_lspci },
+    { "cpuinfo", "cpuinfo",                     "CPU features, SSE and timer state",  cmd_cpuinfo },
     { "crash",   "crash <div0|null|ud|assert|bp>","fault on purpose to see the panic",cmd_crash },
     { "history", "history",                     "recent commands",                    cmd_history },
     { "reboot",  "reboot",                      "restart the machine",                cmd_reboot },
@@ -802,7 +1042,7 @@ static void read_line(void)
     history_pos = history_count;
 
     for (;;) {
-        int key = keyboard_getkey();
+        int key = shell_read_key();
 
         if (key == '\n') {
             kprintf("\n");
@@ -921,15 +1161,18 @@ void shell_print_banner(void)
         "  #  #  #    #  #     #     #   #    #      #\n"
         "  ####  ######  #     #   #####  ####   ####\n");
     kprintf_color(VGA_COLOR_DARK_GREY,
-        "        preemptive  .  x86-64  .  v0.5\n\n");
+        "     preemptive  .  x86-64  .  desktop  .  v0.6\n\n");
     kprintf("Type ");
     kprintf_color(VGA_COLOR_LIGHT_CYAN, "help");
-    kprintf(" for commands, ");
-    kprintf_color(VGA_COLOR_LIGHT_CYAN, "syscalls");
-    kprintf(" to prove INT 0x80 works,\n");
-    kprintf("or ");
-    kprintf_color(VGA_COLOR_LIGHT_CYAN, "spawn");
-    kprintf(" to watch preemption interleave two processes.\n\n");
+    kprintf(" for commands. Highlights:\n");
+    kprintf_color(VGA_COLOR_LIGHT_CYAN, "  desktop");
+    kprintf("   graphical session       ");
+    kprintf_color(VGA_COLOR_LIGHT_CYAN, "run /bin/demo");
+    kprintf("  a real C++ program\n");
+    kprintf_color(VGA_COLOR_LIGHT_CYAN, "  syscalls");
+    kprintf("  exercise INT 0x80       ");
+    kprintf_color(VGA_COLOR_LIGHT_CYAN, "gfxstat");
+    kprintf("       GPU and frame stats\n\n");
 }
 
 void shell_main(void)

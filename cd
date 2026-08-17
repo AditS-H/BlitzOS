@@ -1,0 +1,7 @@
+[OK] user programs built in bin/
+total 32
+-rwxrwxrwx 1 over9 over9 14800 Aug  3 18:18 demo
+-rwxrwxrwx 1 over9 over9 13712 Aug  3 18:18 hello
+[ISO] BlitzOS.iso
+[OK] Bootable ISO: BlitzOS.iso
+[QEMU] Starting BlitzOS...

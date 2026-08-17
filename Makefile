@@ -90,9 +90,21 @@ $(KERNEL_BIN): $(ALL_OBJECTS) scripts/linker.ld | $(BUILD_DIR)
 	@$(LD) $(LDFLAGS) $(ALL_OBJECTS) -o $@
 	@echo "[OK] Kernel linked ($$(du -h $@ | cut -f1))"
 
-$(ISO_FILE): $(KERNEL_BIN) boot/grub/grub.cfg
+# User programs, built by their own Makefile and staged into the ISO so GRUB
+# can hand them to the kernel as boot modules.
+USER_PROGRAMS := userland/bin/hello userland/bin/demo
+
+.PHONY: userland
+userland:
+	@$(MAKE) --no-print-directory -C userland
+
+$(ISO_FILE): $(KERNEL_BIN) boot/grub/grub.cfg userland
 	@echo "[ISO] $@"
 	@cp boot/grub/grub.cfg $(GRUB_DIR)/grub.cfg
+	@mkdir -p $(ISOBOOT_DIR)/bin
+	@for p in $(USER_PROGRAMS); do \
+	    [ -f $$p ] && cp $$p $(ISOBOOT_DIR)/bin/ || true; \
+	done
 	@# grub-mkrescue and xorriso are extremely chatty on success. Capture the
 	@# output and only show it if something actually went wrong.
 	@if ! grub-mkrescue -o $(ISO_FILE) $(ISO_DIR) > $(BUILD_DIR)/grub.log 2>&1; then \
@@ -166,6 +178,7 @@ todo:
 clean:
 	@rm -rf $(BUILD_DIR)
 	@rm -f $(ISO_FILE)
+	@$(MAKE) --no-print-directory -C userland clean
 	@echo "[OK] Clean."
 
 .PHONY: distclean
@@ -188,7 +201,8 @@ config:
 help:
 	@echo "BlitzOS build targets"
 	@echo "====================="
-	@echo "  all           Build the kernel and bootable ISO (default)"
+	@echo "  all           Build the kernel, user programs and bootable ISO"
+	@echo "  userland      Build just the user-space programs"
 	@echo "  run           Boot in QEMU"
 	@echo "  run-serial    Boot in QEMU with the kernel log on stdio"
 	@echo "  run-headless  Boot with no video window, serial only"
