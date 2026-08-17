@@ -227,6 +227,38 @@ void* pmm_alloc_pages(uint64_t count) {
     return 0;  // no contiguous run large enough
 }
 
+// Claim an exact physical range.
+//
+// Unlike the allocators above, the caller has no choice about the address - a
+// fixed-address ELF must land where it was linked. So this is all-or-nothing:
+// check the whole range is free first, and only then mark it, rather than
+// grabbing pages one at a time and having to unwind halfway through.
+int pmm_reserve_range(uint64_t address, uint64_t length) {
+    if (length == 0) {
+        return 0;
+    }
+
+    uint64_t first = address / PAGE_SIZE;
+    uint64_t last  = (address + length + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    if (last > total_pages) {
+        return 0;   // runs past the end of physical memory
+    }
+
+    for (uint64_t i = first; i < last; i++) {
+        if (bitmap_test(i)) {
+            return 0;   // something already owns part of this range
+        }
+    }
+
+    for (uint64_t i = first; i < last; i++) {
+        bitmap_set(i);
+        used_pages++;
+    }
+
+    return 1;
+}
+
 // Free a run allocated with pmm_alloc_pages().
 void pmm_free_pages(void* pages, uint64_t count) {
     uint64_t pfn = (uint64_t)pages / PAGE_SIZE;

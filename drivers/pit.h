@@ -20,6 +20,19 @@
 #define SPEAKER_PORT 0x61
 
 void     pit_init(void);
+
+// Reprogram the timer at runtime.
+//
+// Game mode uses this. At 100 Hz the shortest sleep the scheduler can express
+// is 10 ms, so frame pacing quantises to 10/20/30 ms - asking for a 16 ms
+// budget is impossible. At 1000 Hz the granularity is 1 ms, frame pacing
+// becomes accurate, and a woken process starts running sooner, which is
+// exactly the input latency a game cares about.
+//
+// The cost is 10x the interrupt rate: 1000 context-switch checks per second
+// instead of 100. Measurably more overhead, which is why it is opt-in.
+void     pit_set_frequency(uint32_t hz);
+uint32_t pit_get_frequency(void);
 void     pit_handler(void);       // called from IRQ0
 
 uint64_t pit_get_ticks(void);

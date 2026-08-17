@@ -2,15 +2,54 @@
 
 > Building a high-performance operating system from scratch with multitasking support
 
-## Project Status: PREEMPTIVE MULTITASKING + SYSCALLS + SHELL
+## Project Status: DESKTOP + PROGRAM LOADER
 
-**Current achievement:** Timer-driven preemption, a live `INT 0x80` system call
-interface, an in-memory filesystem, and an interactive shell. Boot it and type
-`help`.
+**v0.6 "Desktop".** Boots to a text console, or to a 1024x768 graphical desktop
+with a window manager, a mouse, and the shell running inside a terminal window.
+Runs separately compiled C and C++ programs through a real ELF64 loader.
 
-Verified in QEMU: 156 context switches over 20 s of uptime with three
-concurrent workers at different priorities, all sleeping, exiting and being
-reaped with the heap returning to its exact pre-spawn size.
+![The BlitzOS desktop](docs/images/desktop-1024x768.png)
+
+Measured on the running desktop under QEMU:
+
+```
+                  normal      game mode
+  Present         309 us      39 us
+  Dirty rects     85% saved   99% saved
+  Page flip       hardware (one GPU register write)
+  Blitter         SSE2, non-temporal stores
+```
+
+### Try it
+
+```bash
+make && make run
+```
+
+Pick `[2]` at the boot menu for the desktop, or `[1]` for the text console.
+Then:
+
+| Command | What it shows |
+|---|---|
+| `run /bin/demo` | A C++ program with virtual dispatch, loaded and relocated at runtime |
+| `run /bin/hello` | A C program making real syscalls, sleeping, writing a file |
+| `syscalls` | Every `INT 0x80` entry point, end to end |
+| `gfxstat` | GPU mode, page flip mode, frame times, dirty-rect savings |
+| `lspci` | Every PCI device and its BARs |
+| `cpuinfo` | CPU features, SSE state, timer frequency |
+| `gamemode` | 1000 Hz timer, 8 ms frames, compositor pinned |
+| `crash null` | The panic screen: register dump, CR2 decode, stack walk |
+| `desktop` | Switch to graphics from the text console |
+
+### Documentation
+
+Start with [whole documentation/INDEX.md](whole%20documentation/INDEX.md).
+
+- [GRAPHICS-STACK.md](whole%20documentation/GRAPHICS-STACK.md) — PCI, GPU mode setting, page flipping, dirty rectangles
+- [GUI-DESKTOP.md](whole%20documentation/GUI-DESKTOP.md) — compositor design, input routing, adding a window
+- [ELF-LOADER.md](whole%20documentation/ELF-LOADER.md) — how a `.cpp` file becomes a process
+- [PERFORMANCE.md](whole%20documentation/PERFORMANCE.md) — every optimisation, measured, with its cost
+- [INTERVIEW-NOTES.md](whole%20documentation/INTERVIEW-NOTES.md) — the story behind each subsystem
 
 ## 📚 Documentation Structure
 
@@ -116,8 +155,27 @@ make help             # Show all available commands
 ### Phase 6: Advanced Drivers (PARTIAL)
 - Serial port (COM1) for debugging, both output and input
 - PC speaker tone generation
+- PCI bus enumeration
+- PS/2 mouse
 - Disk driver (ATA/AHCI) - not started
 - Network stack - not started
+
+### Phase 8: Graphics and desktop (COMPLETE)
+- PCI enumeration to locate the display controller
+- Direct GPU mode setting, no BIOS or bootloader involvement
+- Hardware page flipping via the adapter's Y-offset register
+- Double buffering with dirty-rectangle tracking
+- SSE2 blitter with non-temporal stores, FXSAVE state saving
+- Window manager: draggable windows, z-order, taskbar, mouse cursor
+- The text shell runs unmodified inside a terminal window
+
+### Phase 9: Program loading (COMPLETE, ring 0)
+- ELF64 loader supporting ET_EXEC and ET_DYN
+- R_X86_64_RELATIVE relocation for position-independent executables
+- Programs shipped in the ISO as GRUB modules
+- Freestanding C and C++ user programs
+- Ring 3 groundwork in place (user segments, TSS, DPL 3 syscall gate);
+  blocked on per-process page tables
 
 ### Phase 7: System Calls (COMPLETE)
 - `INT 0x80` gate installed with DPL 3, ready for ring 3
@@ -200,7 +258,7 @@ OS/
 
 ## Current Status
 
-**Status**: v0.5 "Preemption"
+**Status**: v0.6 "Desktop"
 
 **What works**
 - Boot: GRUB2 + Multiboot2, 32 to 64-bit transition, 1 GB identity map
@@ -213,8 +271,10 @@ OS/
 - Interactive shell: 30 commands, line editing, history, tab-stop rendering
 - Diagnostics: `kprintf`, panic screen with register dump, CR2 decoding, stack walk
 
-**Next milestones**: per-process address spaces (needed for `fork`), an ELF
-loader (needed for `exec`), and moving user processes into ring 3.
+**Next milestone**: per-process address spaces. Everything else is blocked on
+it - `fork` needs them, ring 3 is not worth entering without them, and syscall
+pointer validation cannot be real until user pointers come from an untrusted
+address space.
 
 ## Driving the shell over serial
 
@@ -310,4 +370,4 @@ Memory Footprint:    ~2-5 MB
 
 **Remember**: Every expert OS developer started as a beginner. The journey of a thousand lines begins with a single boot sector! 🚀
 
-*Version: 0.5 - Preemption*
+*Version: 0.6 - Desktop*

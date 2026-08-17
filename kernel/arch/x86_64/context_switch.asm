@@ -10,6 +10,15 @@
 
 global context_switch_asm
 
+; Set by sse_init() once SSE is actually usable. FXSAVE/FXRSTOR raise #UD if
+; CR4.OSFXSR is clear, so on a CPU without SSE2 we must skip them entirely.
+extern sse_enabled
+
+; FXSAVE image, immediately after the 144-byte register block. process.c
+; asserts this offset and its 16-byte alignment at compile time - FXSAVE faults
+; on a misaligned destination.
+OFFSET_FPU    equ 144
+
 OFFSET_RAX    equ 0
 OFFSET_RBX    equ 8
 OFFSET_RCX    equ 16
@@ -74,12 +83,35 @@ context_switch_asm:
     lea rax, [rsp + 8]
     mov [rdi + OFFSET_RSP], rax
 
+    ; ---- Save x87 + SSE state ----
+    ;
+    ; 512 bytes of XMM registers, the x87 stack and MXCSR. Without this, any
+    ; process that touches SSE would have its vector registers silently
+    ; clobbered by the next process to run - a corruption that shows up as
+    ; wrong pixels or wrong arithmetic far from the actual switch.
+    ;
+    ; RAX is already saved above, so it is free as scratch.
+    mov al, [sse_enabled]
+    test al, al
+    jz .load
+
+    fxsave [rdi + OFFSET_FPU]
     jmp .load
 
 .no_save:
     add rsp, 8                          ; discard the RFLAGS we pushed
 
 .load:
+    ; ---- Restore x87 + SSE state ----
+    ; Before the general purpose registers, because this needs a scratch
+    ; register and RSI (the pointer to `next`) is still live.
+    mov al, [sse_enabled]
+    test al, al
+    jz .load_gprs
+
+    fxrstor [rsi + OFFSET_FPU]
+
+.load_gprs:
     ; ---- Restore the incoming process ----
     ; RSI still points at `next`, so it must be loaded last.
     mov rsp, [rsi + OFFSET_RSP]

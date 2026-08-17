@@ -50,7 +50,7 @@ static process_t* all_processes[MAX_PROCESSES];
 
 // The idle process lives in .bss rather than the heap: it must exist before
 // anything else can run, and it must never fail to allocate.
-static process_t idle_process;
+static process_t idle_process __attribute__((aligned(FPU_STATE_ALIGN)));
 static uint8_t   idle_stack[PROCESS_STACK_SIZE] __attribute__((aligned(16)));
 
 volatile uint8_t need_reschedule = 0;
@@ -73,6 +73,10 @@ _Static_assert(offsetof(cpu_context_t, rip) == 128,
 _Static_assert(offsetof(cpu_context_t, rflags) == 136,
                "context_switch.asm OFFSET_RFLAGS is 136");
 _Static_assert(sizeof(cpu_context_t) == 144, "cpu_context_t must be 18 qwords");
+_Static_assert(offsetof(process_t, fpu_state) == 144,
+               "context_switch.asm OFFSET_FPU is 144");
+_Static_assert(offsetof(process_t, fpu_state) % FPU_STATE_ALIGN == 0,
+               "FXSAVE requires the state image to be 16-byte aligned");
 
 // ---------------------------------------------------------------------------
 // Ready queue (intrusive doubly-linked list)
@@ -214,6 +218,10 @@ static void process_setup_context(process_t* proc, void* stack_base,
     // the first time the process ran.
     memset(&proc->registers, 0, sizeof(proc->registers));
 
+    // Give the process a valid FXSAVE image. A zeroed one would leave MXCSR at
+    // 0, unmasking every SSE exception so the first inexact result traps.
+    sse_init_fpu_state(proc->fpu_state);
+
     uint64_t top = ((uint64_t)stack_base + PROCESS_STACK_SIZE) & ~0xFULL;
 
     // Plant the exit trampoline as the entry function's return address, so
@@ -294,7 +302,11 @@ process_t* process_create(const char* name, void (*entry)(void), uint32_t priori
         return NULL;
     }
 
-    process_t* proc = (process_t*)kmalloc(sizeof(process_t));
+    // kmalloc_aligned, not kmalloc: the TCB embeds the FXSAVE image, and
+    // FXSAVE faults on a destination that is not 16-byte aligned. Anything
+    // allocated this way must be released with kfree_aligned().
+    process_t* proc = (process_t*)kmalloc_aligned(sizeof(process_t),
+                                                  FPU_STATE_ALIGN);
     if (!proc) {
         irq_restore(flags);
         kerror("process_create: out of memory for TCB\n");
@@ -306,7 +318,7 @@ process_t* process_create(const char* name, void (*entry)(void), uint32_t priori
 
     void* stack = kmalloc(PROCESS_STACK_SIZE);
     if (!stack) {
-        kfree(proc);
+        kfree_aligned(proc);
         irq_restore(flags);
         kerror("process_create: out of memory for kernel stack\n");
         return NULL;
@@ -337,7 +349,7 @@ process_t* process_create(const char* name, void (*entry)(void), uint32_t priori
 
     if (!table_insert(proc)) {
         kfree(stack);
-        kfree(proc);
+        kfree_aligned(proc);
         irq_restore(flags);
         kerror("process_create: process table full\n");
         return NULL;
@@ -593,7 +605,7 @@ uint32_t scheduler_reap(void)
 
         if (p->kernel_stack) kfree(p->kernel_stack);
         if (p->user_stack)   kfree(p->user_stack);
-        kfree(p);
+        kfree_aligned(p);   // allocated with kmalloc_aligned for FXSAVE
 
         reaped++;
     }

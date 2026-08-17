@@ -7,6 +7,7 @@
 #include "../../../drivers/pit.h"
 #include "../../../drivers/keyboard.h"
 #include "../../../drivers/serial.h"
+#include "../../../drivers/mouse.h"
 
 // Counts every hardware IRQ we have seen, for the shell's `irqstat` command.
 static uint64_t irq_counts[16];
@@ -150,6 +151,9 @@ void irq_handler(registers_t* regs)
     case 4:
         serial_handler();    // COM1 input, feeds the same console queue
         break;
+    case 12:
+        mouse_handler();     // PS/2 auxiliary device
+        break;
     default:
         break;
     }
@@ -227,6 +231,7 @@ void interrupts_init(void)
     pic_unmask_irq(1);   // keyboard
     pic_unmask_irq(4);   // COM1 receive - lets the shell be driven over serial
     pic_unmask_irq(2);   // cascade - required for any slave-PIC line to work
+    // IRQ12 (mouse) is unmasked by mouse_init() once a device answers.
 
     // Deliberately NOT enabling interrupts here.
     //

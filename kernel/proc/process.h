@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "../arch/x86_64/sse.h"
 
 #define MAX_PROCESSES       64
 #define PROCESS_STACK_SIZE  16384   // 16 KB kernel stack per process
@@ -29,6 +30,7 @@
 #define WAIT_CHANNEL_NONE      0
 #define WAIT_CHANNEL_KEYBOARD  1
 #define WAIT_CHANNEL_SERIAL    2
+#define WAIT_CHANNEL_TERMINAL  3   // GUI terminal window input queue
 
 // Process states
 typedef enum {
@@ -59,6 +61,17 @@ typedef struct {
 typedef struct process_t {
     // ---- Must stay first: the assembly context switcher assumes offset 0 ----
     cpu_context_t registers;
+
+    // ---- FXSAVE image: x87 + SSE state ----
+    //
+    // Placed immediately after the 144-byte register block, which is a
+    // multiple of 16, so this lands 16-byte aligned - FXSAVE faults otherwise.
+    // context_switch.asm addresses it at a fixed offset and process.c asserts
+    // that offset at compile time.
+    //
+    // Only touched when sse_init() succeeded; on a CPU without SSE2 the
+    // context switcher skips FXSAVE entirely and this is dead weight.
+    uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(FPU_STATE_ALIGN)));
 
     // ---- Identity ----
     uint32_t pid;

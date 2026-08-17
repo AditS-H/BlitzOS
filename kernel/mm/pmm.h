@@ -27,6 +27,11 @@ void* pmm_alloc_pages(uint64_t count);
 // Free a run previously returned by pmm_alloc_pages().
 void pmm_free_pages(void* pages, uint64_t count);
 
+// Claim a specific physical range, refusing if any page in it is already
+// allocated. Needed by the ELF loader for fixed-address (ET_EXEC) programs,
+// which must go exactly where they were linked. Returns 1 on success.
+int pmm_reserve_range(uint64_t address, uint64_t length);
+
 // Get total memory in bytes
 uint64_t pmm_get_total_memory(void);
 
